@@ -1,0 +1,206 @@
+@import "tailwindcss";
+
+/* Atlas ERP console token bridge.
+ *
+ * contract.md v1.1.1 token table is the authority for colour; contract.md v1.2.0
+ * fixes this mapping from the shadcn/Tailwind variables onto those tokens. The
+ * two `:root`/`.dark` blocks below are the ONLY place a raw colour value may
+ * appear in the whole frontend. Every other rule, and every component, resolves
+ * to a variable or a Tailwind utility derived from one.
+ *
+ * The 18 `--atlas-*` names are declared exactly once per mode. Mode is one
+ * class on <html>, so switching is one attribute.
+ */
+
+@custom-variant dark (&:is(.dark *));
+
+/* --- contract.md v1.1.1, light mode ------------------------------------- */
+:root {
+  color-scheme: light;
+  --atlas-bg-canvas: #f7f2eb;
+  --atlas-bg-surface: #eae2d6;
+  --atlas-fg-default: #2d0000;
+  --atlas-fg-muted: #6a2f2f;
+  --atlas-accent: #8b9a6e;
+  --atlas-link: #2d0000;
+  --atlas-border-divider: #eeeeee;
+  --atlas-border-control: #757d6f;
+  --atlas-on-accent: #2d0000;
+  --atlas-focus-ring: #2d0000;
+  --atlas-success-fg: #2a7c13;
+  --atlas-success-bg: #c7d3c0;
+  --atlas-warning-fg: #2d0000;
+  --atlas-warning-bg: #c8a96b;
+  --atlas-danger-fg: #6d0808;
+  --atlas-danger-bg: #ffdada;
+  --atlas-info-fg: #2d0000;
+  --atlas-info-bg: #fbe6c2;
+}
+
+/* --- contract.md v1.1.1, dark mode -------------------------------------- */
+.dark {
+  color-scheme: dark;
+  --atlas-bg-canvas: #41444b;
+  --atlas-bg-surface: #52575d;
+  --atlas-fg-default: #dfd8c8;
+  --atlas-fg-muted: #b7b3a9;
+  --atlas-accent: #cabfab;
+  --atlas-link: #dfd8c8;
+  --atlas-border-divider: #52575d;
+  --atlas-border-control: #9aa394;
+  --atlas-on-accent: #41444b;
+  --atlas-focus-ring: #dfd8c8;
+  --atlas-success-fg: #2d0000;
+  --atlas-success-bg: #c7d3c0;
+  --atlas-warning-fg: #2d0000;
+  --atlas-warning-bg: #c8a96b;
+  --atlas-danger-fg: #2d0000;
+  --atlas-danger-bg: #ffdada;
+  --atlas-info-fg: #2d0000;
+  --atlas-info-bg: #fbe6c2;
+}
+
+/* --- contract.md v1.2.0 required shadcn -> Atlas mapping ---------------- */
+/* Derived, not a second source of truth: every value below is a var() that
+   resolves to a --atlas-* name from the table above. */
+:root {
+  --background: var(--atlas-bg-canvas);
+  --foreground: var(--atlas-fg-default);
+  --card: var(--atlas-bg-surface);
+  --card-foreground: var(--atlas-fg-default);
+  --popover: var(--atlas-bg-surface);
+  --popover-foreground: var(--atlas-fg-default);
+  --primary: var(--atlas-accent);
+  --primary-foreground: var(--atlas-on-accent);
+  /* No separate muted surface token, so a muted fill is the surface token and
+     muted text is fg.muted, which the contract restricts to canvas use. */
+  --muted: var(--atlas-bg-surface);
+  --muted-foreground: var(--atlas-fg-muted);
+  --border: var(--atlas-border-divider);
+  --input: var(--atlas-border-control);
+  --ring: var(--atlas-focus-ring);
+  --link: var(--atlas-link);
+
+  /* Each state is a foreground-on-background pair, used as supplied.
+     state.success is the one exception the contract names: the supplied light
+     foreground on state.success.bg is 3.38:1, so normal text uses the accessible
+     ink and the supplied foreground stays the non-text indicator. */
+  --success-bg: var(--atlas-success-bg);
+  --success-text: var(--atlas-fg-default);
+  --success-indicator: var(--atlas-success-fg);
+  --warning-bg: var(--atlas-warning-bg);
+  --warning-text: var(--atlas-warning-fg);
+  --danger-bg: var(--atlas-danger-bg);
+  --danger-text: var(--atlas-danger-fg);
+  --info-bg: var(--atlas-info-bg);
+  --info-text: var(--atlas-info-fg);
+}
+
+/* --- Tailwind v4 theme -------------------------------------------------- */
+/* `inline` keeps the utilities resolving through to the variables above, so a
+   token override in either mode block re-colours the whole app. */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-link: var(--link);
+  --color-success-bg: var(--success-bg);
+  --color-success-text: var(--success-text);
+  --color-success-indicator: var(--success-indicator);
+  --color-warning-bg: var(--warning-bg);
+  --color-warning-text: var(--warning-text);
+  --color-danger-bg: var(--danger-bg);
+  --color-danger-text: var(--danger-text);
+  --color-info-bg: var(--info-bg);
+  --color-info-text: var(--info-text);
+  --radius-lg: 0.5rem;
+  --radius-md: 0.375rem;
+  --radius-sm: 0.25rem;
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+
+  /* A link carries the link token and an underline, so it never relies on
+     colour alone (contract: link.default). */
+  a {
+    color: var(--link);
+    text-decoration: underline;
+  }
+
+  a:hover {
+    text-decoration-thickness: 2px;
+  }
+
+  /* The focus ring is a token and is applied to every keyboard-focusable
+     control (contract: focus.ring). */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  /* Surface-safe rules.
+   *
+   * fg.muted and border.control are both derived against bg.canvas. Inside a
+   * card or tile the surface sits under them, so a muted line is re-pointed to
+   * the body ink, a control border takes the control token, and a muted fill
+   * becomes the canvas so a row or chip stays visible on the surface.
+   * Re-pointing the variable (rather than the utility class) makes every
+   * descendant surface-safe without a second set of class names. */
+  [data-surface="true"] {
+    --muted-foreground: var(--atlas-fg-default);
+    --border: var(--atlas-border-control);
+    --muted: var(--atlas-bg-canvas);
+  }
+
+  /* A menu or listbox is painted on the surface token, so its highlighted row
+   * takes the canvas fill. Radix marks the highlighted row with
+   * data-highlighted rather than :focus, and a control whose highlight is the
+   * same colour as its own background has no visible keyboard focus. */
+  [data-slot="select-content"],
+  [data-slot="dropdown-menu-content"] {
+    --muted: var(--atlas-bg-canvas);
+  }
+
+  .atlas-chip {
+    display: inline-block;
+    border: 1px solid var(--input);
+    border-radius: 999px;
+    padding: 0.1rem 0.5rem;
+    background: var(--background);
+    color: var(--foreground);
+    font-size: 0.75rem;
+  }
+}
+
+/* Utility used by components that must not carry a raw colour. */
+@utility atlas-surface {
+  background-color: var(--card);
+  color: var(--card-foreground);
+}

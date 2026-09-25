@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Atlas ERP console</title>
+    <script>
+      // Apply the persisted or system mode before first paint so the page never
+      // renders light and then flips. The React provider reads the same storage
+      // key ("atlas-erp-theme") and owns every later change. This is the only
+      // script in the app; no component ships inline JavaScript.
+      (function () {
+        try {
+          var stored = localStorage.getItem("atlas-erp-theme");
+          var dark =
+            stored === "dark" ||
+            (stored !== "light" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+        } catch (error) {
+          /* Storage can be unavailable; the light default is a tokenized page. */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

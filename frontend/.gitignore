@@ -1,0 +1,8 @@
+# Build output and installed dependencies; the Node surface stays out of the
+# Python package's import and test path (contract.md v1.2.0 risk).
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+*.tsbuildinfo
