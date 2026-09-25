@@ -4,6 +4,12 @@ This is the product's first browser surface: a server-rendered HTML dashboard
 plus three read-only JSON routes, built on the standard library with no
 external CSS or JavaScript and no build step.
 
+Every colour on the page is a shared Atlas UI design token from
+``contract.md`` v1.1.1, exposed as ``--atlas-*`` custom properties.  The mode
+is explicit rather than read from the operating system: ``?theme=light`` and
+``?theme=dark`` select it, the page defaults to light, and any other value
+falls back to light rather than rendering without tokens.
+
 Everything it shows is demo fixture data.  The catalogue mirrors the committed
 ``db/seed.sql`` example rows through :mod:`atlas_erp.demo_catalog`, and the
 sales, stock, and journal history is process-local state in a
@@ -25,7 +31,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, cast
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .business import AuditSnapshot, Business, JournalEntry, Sale
 from .demo_catalog import DemoCatalog, DemoItem, build_demo_catalog
@@ -37,6 +43,10 @@ JSON_CONTENT_TYPE = "application/json"
 HTML_CONTENT_TYPE = "text/html; charset=utf-8"
 TITLE = "Atlas ERP console"
 RECENT_ACTIVITY_LIMIT = 5
+# The only two modes the token table supplies.  A request for anything else falls
+# back to light, so an unusable value can never render an untokenized page.
+THEMES = ("light", "dark")
+DEFAULT_THEME = "light"
 # Only the one method each route serves; anything else is a 405.
 _ROUTE_METHODS = {
     "/": "GET",
@@ -54,68 +64,126 @@ _DEMO_SALES: tuple[tuple[str, str, str, int], ...] = (
     ("sale-2026-0924", "counter-breda", "item-aurora-linen-shirt", 1),
 )
 
+# The shared Atlas UI token table (contract v1.1.1), one block per mode.  Every
+# rule below resolves to these variables, so no colour is written twice and no
+# rule carries a literal: switching mode is one attribute on <html>.
 _STYLE = """
-:root {
-  color-scheme: light dark;
-  --bg: #0f1115; --panel: #171a21; --line: #262b36;
-  --ink: #e7eaf0; --muted: #98a2b3; --accent: #8ab8ff; --good: #5fd39a; --warn: #f0c26a;
+:root[data-theme="light"] {
+  color-scheme: light;
+  --atlas-bg-canvas: #F7F2EB;
+  --atlas-bg-surface: #EAE2D6;
+  --atlas-fg-default: #2D0000;
+  --atlas-fg-muted: #6A2F2F;
+  --atlas-accent: #8B9A6E;
+  --atlas-link: #2D0000;
+  --atlas-border-divider: #EEEEEE;
+  --atlas-border-control: #757D6F;
+  --atlas-on-accent: #2D0000;
+  --atlas-focus-ring: #2D0000;
+  --atlas-success-fg: #2A7C13;
+  --atlas-success-bg: #C7D3C0;
+  --atlas-warning-fg: #2D0000;
+  --atlas-warning-bg: #C8A96B;
+  --atlas-danger-fg: #6D0808;
+  --atlas-danger-bg: #FFDADA;
+  --atlas-info-fg: #2D0000;
+  --atlas-info-bg: #FBE6C2;
 }
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #f5f6f8; --panel: #ffffff; --line: #e2e5ea;
-    --ink: #191c22; --muted: #5c6675; --accent: #1b5fd0; --good: #1a7f4f; --warn: #96650a;
-  }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --atlas-bg-canvas: #41444B;
+  --atlas-bg-surface: #52575D;
+  --atlas-fg-default: #DFD8C8;
+  --atlas-fg-muted: #B7B3A9;
+  --atlas-accent: #CABFAB;
+  --atlas-link: #DFD8C8;
+  --atlas-border-divider: #52575D;
+  --atlas-border-control: #9AA394;
+  --atlas-on-accent: #41444B;
+  --atlas-focus-ring: #DFD8C8;
+  --atlas-success-fg: #2D0000;
+  --atlas-success-bg: #C7D3C0;
+  --atlas-warning-fg: #2D0000;
+  --atlas-warning-bg: #C8A96B;
+  --atlas-danger-fg: #2D0000;
+  --atlas-danger-bg: #FFDADA;
+  --atlas-info-fg: #2D0000;
+  --atlas-info-bg: #FBE6C2;
 }
 * { box-sizing: border-box; }
 body {
-  margin: 0; padding: 1.5rem; background: var(--bg); color: var(--ink);
+  margin: 0; padding: 1.5rem;
+  background: var(--atlas-bg-canvas); color: var(--atlas-fg-default);
   font: 15px/1.5 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
 }
-a { color: var(--accent); }
+/* A link carries the link token and an underline, so it never relies on colour
+   alone, and the accent is only ever a background (see .theme-current). */
+a { color: var(--atlas-link); text-decoration: underline; }
+a:hover { text-decoration-thickness: 2px; }
+/* The focus ring is a token and is applied to every focusable control. */
+:focus-visible { outline: 2px solid var(--atlas-focus-ring); outline-offset: 2px; }
 h1 { font-size: 1.5rem; margin: 0; }
 h2 { font-size: 1.05rem; margin: 0 0 .75rem; }
 h3 { font-size: 1rem; margin: 0 0 .2rem; }
 code { font-family: ui-monospace, Consolas, monospace; font-size: .9em; }
 header, section { margin: 0 0 1.5rem; }
 header { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: baseline; }
-nav { display: flex; gap: .75rem; flex-wrap: wrap; }
-.muted { color: var(--muted); }
+nav { display: flex; gap: .75rem; flex-wrap: wrap; align-items: baseline; }
+.theme-current { padding: .1rem .5rem; border-radius: 999px; font-size: .75rem;
+  background: var(--atlas-accent); color: var(--atlas-on-accent); }
+/* The muted token is derived against bg.canvas, so it is only painted on the
+   canvas: on a card or tile the body token carries the secondary lines instead. */
+.muted { color: var(--atlas-fg-muted); }
+.card .muted, .card .meta, .card th, .tile .label { color: var(--atlas-fg-default); }
 .banner {
-  margin: .75rem 0 0; padding: .7rem .9rem; border: 1px solid var(--warn);
-  border-radius: 8px; background: color-mix(in srgb, var(--warn) 12%, transparent);
+  margin: .75rem 0 0; padding: .7rem .9rem; border-radius: 8px;
+  border: 1px solid var(--atlas-warning-fg);
+  background: var(--atlas-warning-bg); color: var(--atlas-warning-fg);
 }
 .tiles { display: grid; gap: .75rem;
   grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr)); }
-.tile { padding: .7rem .8rem; border: 1px solid var(--line); border-radius: 8px;
-  background: var(--panel); }
+.tile { padding: .7rem .8rem; border: 1px solid var(--atlas-border-divider);
+  border-radius: 8px; background: var(--atlas-bg-surface); }
 .tile .value { font-size: 1.35rem; font-variant-numeric: tabular-nums; }
-.tile .label { color: var(--muted); font-size: .8rem; }
+.tile .label { font-size: .8rem; }
 .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr)); }
-.card { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
-  overflow: hidden; }
+.card { border: 1px solid var(--atlas-border-divider); border-radius: 10px;
+  background: var(--atlas-bg-surface); overflow: hidden; }
 .card .body { padding: .8rem .9rem 1rem; }
 .card img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; display: block;
-  background: var(--line); }
-.meta { margin: 0 0 .5rem; color: var(--muted); font-size: .85rem; }
+  background: var(--atlas-border-divider); }
+.meta { margin: 0 0 .5rem; color: var(--atlas-fg-muted); font-size: .85rem; }
 .price { margin: 0 0 .5rem; font-variant-numeric: tabular-nums; }
 .chips { display: flex; flex-wrap: wrap; gap: .3rem; margin: 0 0 .6rem; padding: 0;
   list-style: none; }
 .chip, .status {
-  display: inline-block; padding: .1rem .45rem; border: 1px solid var(--line);
-  border-radius: 999px; font-size: .75rem; color: var(--muted);
+  display: inline-block; padding: .1rem .45rem;
+  border: 1px solid var(--atlas-border-control); border-radius: 999px;
+  font-size: .75rem;
 }
-.status-open { color: var(--warn); border-color: var(--warn); }
-.status-received, .status-good { color: var(--good); border-color: var(--good); }
+.chip { background: var(--atlas-info-bg); color: var(--atlas-info-fg); }
+/* The control border is derived against bg.canvas, so a neutral chip is filled
+   with the canvas and bordered on it wherever the chip sits. */
+.status { background: var(--atlas-bg-canvas); color: var(--atlas-fg-default); }
+.status-open { background: var(--atlas-warning-bg); color: var(--atlas-warning-fg); }
+.status-bad { background: var(--atlas-danger-bg); color: var(--atlas-danger-fg); }
+/* The light success pair is 3.38:1, so it is used as a non-text marker with the
+   body-text token beside it rather than as the status text colour. */
+.status-received::before, .status-good::before {
+  content: ""; display: inline-block; margin-right: .3em;
+  width: .55em; height: .55em; border-radius: 50%;
+  background: var(--atlas-success-bg); border: 1px solid var(--atlas-success-fg);
+}
 table { width: 100%; border-collapse: collapse; font-size: .85rem; }
-th, td { padding: .35rem .4rem; text-align: left; border-bottom: 1px solid var(--line);
-  vertical-align: middle; }
-th { color: var(--muted); font-weight: 600; }
+th, td { padding: .35rem .4rem; text-align: left;
+  border-bottom: 1px solid var(--atlas-border-divider); vertical-align: middle; }
+th { color: var(--atlas-fg-muted); font-weight: 600; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .variant img { width: 2.2rem; height: 2.2rem; border-radius: 4px; }
 .variant td:first-child { width: 3rem; }
 .variant-id { font-family: ui-monospace, Consolas, monospace; font-size: .75rem; }
 .scroll { overflow-x: auto; }
-footer { color: var(--muted); font-size: .8rem; }
+footer { color: var(--atlas-fg-muted); font-size: .8rem; }
 """
 
 
@@ -133,6 +201,22 @@ def _money(cents: int) -> str:
 
 def _chip(value: object) -> str:
     return f'<li class="chip">{_e(value)}</li>'
+
+
+def normalise_theme(theme: object) -> str:
+    """Return the supported mode named by ``theme``, else :data:`DEFAULT_THEME`.
+
+    The comparison is exact on purpose: an unknown or hostile value is not a
+    token table, so it renders light rather than a page with no tokens.
+    """
+
+    if isinstance(theme, str) and theme in THEMES:
+        return theme
+    return DEFAULT_THEME
+
+
+def _other_theme(theme: str) -> str:
+    return "dark" if theme == "light" else "light"
 
 
 def _normalise_port(port: int) -> int:
@@ -207,7 +291,8 @@ def health_payload(business: Business) -> dict[str, object]:
     }
 
 
-def _render_header() -> str:
+def _render_header(theme: str) -> str:
+    other = _other_theme(theme)
     return (
         "<header>"
         f"<h1>{_e(TITLE)}</h1>"
@@ -216,6 +301,8 @@ def _render_header() -> str:
         '<a href="/api/catalog">/api/catalog</a>'
         '<a href="/api/audit">/api/audit</a>'
         '<a href="/api/health">/api/health</a>'
+        f'<a href="/?theme={other}">{other} mode</a>'
+        f'<span class="theme-current">{_e(theme)} mode</span>'
         "</nav>"
         "</header>"
         '<p class="banner" role="status"><strong>Demo fixture, in memory.</strong> '
@@ -388,7 +475,7 @@ def _render_activity(audit: AuditSnapshot) -> str:
         f'<td class="muted">{_e(journal.sale_id or "-")}</td>'
         f'<td class="num">{_money(journal.total_debits_cents)}</td>'
         f'<td class="num">{_money(journal.total_credits_cents)}</td>'
-        f'<td><span class="status status-{"good" if _balanced(journal) else "open"}">'
+        f'<td><span class="status status-{"good" if _balanced(journal) else "bad"}">'
         f'{"balanced" if _balanced(journal) else "unbalanced"}</span></td>'
         "</tr>"
         for journal in audit.journals[-RECENT_ACTIVITY_LIMIT:]
@@ -408,19 +495,28 @@ def _render_activity(audit: AuditSnapshot) -> str:
     )
 
 
-def render_console(business: Business, catalog: DemoCatalog) -> str:
-    """Render the whole console as one HTML document."""
+def render_console(
+    business: Business, catalog: DemoCatalog, theme: str = DEFAULT_THEME
+) -> str:
+    """Render the whole console as one HTML document.
 
+    ``theme`` selects the token block; anything that is not a supported mode
+    name renders :data:`DEFAULT_THEME`, so the page is always tokenized.  The
+    argument is positional-optional and defaults to light, which keeps every
+    existing caller unchanged.
+    """
+
+    mode = normalise_theme(theme)
     audit = business.audit_snapshot()
     return (
         "<!doctype html>\n"
-        '<html lang="en">\n<head>\n'
+        f'<html lang="en" data-theme="{_e(mode)}">\n<head>\n'
         '<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f"<title>{_e(TITLE)}</title>\n"
         f"<style>\n{_STYLE}\n</style>\n"
         "</head>\n<body>\n"
-        f"{_render_header()}\n"
+        f"{_render_header(mode)}\n"
         f"{_render_tiles(catalog, audit)}\n"
         f"{_render_catalog(catalog)}\n"
         f"{_render_stock(catalog)}\n"
@@ -466,9 +562,11 @@ class WebHandler(BaseHTTPRequestHandler):
             if path == "/":
                 self._send(
                     200,
-                    render_console(self.server.business, self.server.catalog).encode(
-                        "utf-8"
-                    ),
+                    render_console(
+                        self.server.business,
+                        self.server.catalog,
+                        self._query().get("theme", DEFAULT_THEME),
+                    ).encode("utf-8"),
                     HTML_CONTENT_TYPE,
                 )
                 return
@@ -508,6 +606,15 @@ class WebHandler(BaseHTTPRequestHandler):
             return urlsplit(self.path).path
         except ValueError:
             return self.path.split("?", 1)[0]
+
+    def _query(self) -> dict[str, str]:
+        """Return the last value of each query parameter, or nothing at all."""
+
+        try:
+            query = urlsplit(self.path).query
+        except ValueError:
+            return {}
+        return {name: values[-1] for name, values in parse_qs(query).items()}
 
     def _method_not_allowed(self) -> None:
         allowed = _ROUTE_METHODS.get(self._path())
@@ -707,14 +814,17 @@ if __name__ == "__main__":
 __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "DEFAULT_THEME",
     "HTML_CONTENT_TYPE",
     "JSON_CONTENT_TYPE",
     "PORT_ENV",
+    "THEMES",
     "TITLE",
     "WebHandler",
     "WebServer",
     "build_demo_business",
     "health_payload",
     "main",
+    "normalise_theme",
     "render_console",
 ]

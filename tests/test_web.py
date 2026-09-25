@@ -22,17 +22,52 @@ from atlas_erp.demo_catalog import (
 from atlas_erp.web import (
     DEFAULT_HOST,
     DEFAULT_PORT,
+    DEFAULT_THEME,
     PORT_ENV,
+    THEMES,
     WebServer,
     build_demo_business,
     health_payload,
     main,
+    normalise_theme,
     render_console,
 )
 
 SEED_PATH = Path(__file__).resolve().parents[1] / "db" / "seed.sql"
 # The seed quotes every text value and leaves counts as bare integers.
 _SEED_VALUE = re.compile(r"'([^']*)'|(\d+)")
+# Every six-digit hex literal in the style block must be a contract token value,
+# so a colour hardcoded in a rule fails instead of shadowing the token table.
+_HEX = re.compile(r"#[0-9A-Fa-f]{6}\b")
+
+# contract.md v1.1.1, token name -> light value, dark value.
+TOKENS = {
+    "--atlas-bg-canvas": ("#F7F2EB", "#41444B"),
+    "--atlas-bg-surface": ("#EAE2D6", "#52575D"),
+    "--atlas-fg-default": ("#2D0000", "#DFD8C8"),
+    "--atlas-fg-muted": ("#6A2F2F", "#B7B3A9"),
+    "--atlas-accent": ("#8B9A6E", "#CABFAB"),
+    "--atlas-link": ("#2D0000", "#DFD8C8"),
+    "--atlas-border-divider": ("#EEEEEE", "#52575D"),
+    "--atlas-border-control": ("#757D6F", "#9AA394"),
+    "--atlas-on-accent": ("#2D0000", "#41444B"),
+    "--atlas-focus-ring": ("#2D0000", "#DFD8C8"),
+    "--atlas-success-fg": ("#2A7C13", "#2D0000"),
+    "--atlas-success-bg": ("#C7D3C0", "#C7D3C0"),
+    "--atlas-warning-fg": ("#2D0000", "#2D0000"),
+    "--atlas-warning-bg": ("#C8A96B", "#C8A96B"),
+    "--atlas-danger-fg": ("#6D0808", "#2D0000"),
+    "--atlas-danger-bg": ("#FFDADA", "#FFDADA"),
+    "--atlas-info-fg": ("#2D0000", "#2D0000"),
+    "--atlas-info-bg": ("#FBE6C2", "#FBE6C2"),
+}
+_TOKEN_VALUES = {value for pair in TOKENS.values() for value in pair}
+
+
+def style_block(document: str) -> str:
+    start = document.index("<style>")
+    end = document.index("</style>")
+    return document[start : end + len("</style>")]
 
 
 def seed_rows(table: str) -> list[dict[str, str]]:
@@ -334,6 +369,241 @@ class WebConsoleRenderTests(unittest.TestCase):
         self.assertEqual(self.document.count('class="banner"'), 1)
         self.assertEqual(self.document.count("<h2>Catalog</h2>"), 1)
         self.assertNotIn("<script", self.document)
+
+
+def token_block(document: str, theme: str) -> str:
+    """Return the one ``:root[data-theme]`` block that declares a mode."""
+
+    marker = f':root[data-theme="{theme}"] {{'
+    start = document.index(marker)
+    return document[start : document.index("}", start)]
+
+
+def http_get(address: tuple[str, int], path: str, method: str = "GET") -> bytes:
+    connection = HTTPConnection(*address, timeout=5)
+    try:
+        connection.request(method, path)
+        response = connection.getresponse()
+        body = response.read()
+        if response.status != 200:
+            raise AssertionError(f"{method} {path} answered {response.status}")
+        return body
+    finally:
+        connection.close()
+
+
+class ThemeTokenTests(unittest.TestCase):
+    """The console resolves every colour to a shared token in both modes."""
+
+    def setUp(self) -> None:
+        self.server = WebServer(port=0)
+        self.server.start()
+        self.addCleanup(self.server.close)
+        self.document = self.get("/?theme=light")
+        self.dark_document = self.get("/?theme=dark")
+
+    def get(self, path: str) -> str:
+        return http_get(self.server.address, path).decode("utf-8")
+
+    def test_light_mode_carries_the_light_token_values(self) -> None:
+        self.assertIn('<html lang="en" data-theme="light">', self.document)
+
+        block = token_block(self.document, "light")
+        self.assertIn("color-scheme: light;", block)
+        for name, (light, _dark) in TOKENS.items():
+            self.assertIn(f"{name}: {light};", block)
+
+    def test_dark_mode_carries_the_dark_token_values(self) -> None:
+        self.assertIn('<html lang="en" data-theme="dark">', self.dark_document)
+
+        block = token_block(self.dark_document, "dark")
+        self.assertIn("color-scheme: dark;", block)
+        for name, (_light, dark) in TOKENS.items():
+            self.assertIn(f"{name}: {dark};", block)
+
+    def test_every_token_is_declared_once_in_each_mode_block(self) -> None:
+        for document in (self.document, self.dark_document):
+            for theme in THEMES:
+                names = re.findall(
+                    r"(--atlas-[\w-]+)\s*:", token_block(document, theme)
+                )
+                self.assertEqual(len(names), len(set(names)))
+                self.assertEqual(set(names), set(TOKENS))
+
+    def test_no_colour_is_hardcoded_outside_the_token_blocks(self) -> None:
+        for document in (self.document, self.dark_document):
+            style = style_block(document)
+            for colour in _HEX.findall(style):
+                self.assertIn(colour, _TOKEN_VALUES, colour)
+            # No leftover custom properties from the pre-token stylesheet.
+            self.assertEqual(
+                set(re.findall(r"(--[\w-]+)\s*:", style)) - set(TOKENS), set()
+            )
+            for old in ("--bg", "--panel", "--line", "--ink", "--muted", "--good", "--warn"):
+                self.assertNotIn(f"var({old})", style)
+                self.assertNotIn(f"{old}:", style)
+
+    def test_the_rules_use_tokens_for_every_role_the_contract_names(self) -> None:
+        style = style_block(self.dark_document)
+
+        for expected in (
+            "background: var(--atlas-bg-canvas); color: var(--atlas-fg-default);",
+            "background: var(--atlas-bg-surface)",
+            "color: var(--atlas-fg-muted)",
+            "a { color: var(--atlas-link); text-decoration: underline; }",
+            ":focus-visible { outline: 2px solid var(--atlas-focus-ring);",
+            "border: 1px solid var(--atlas-border-divider)",
+            "border: 1px solid var(--atlas-border-control)",
+            "background: var(--atlas-accent); color: var(--atlas-on-accent);",
+            "background: var(--atlas-warning-bg); color: var(--atlas-warning-fg);",
+            "background: var(--atlas-danger-bg); color: var(--atlas-danger-fg);",
+            "background: var(--atlas-info-bg); color: var(--atlas-info-fg);",
+            "background: var(--atlas-success-bg); border: 1px solid var(--atlas-success-fg);",
+            # The muted token is only ever painted on bg.canvas, and a neutral
+            # status chip is filled with it, so the control border is too.
+            ".muted { color: var(--atlas-fg-muted); }",
+            ".card .muted, .card .meta, .card th, .tile .label "
+            "{ color: var(--atlas-fg-default); }",
+            ".status { background: var(--atlas-bg-canvas); color: var(--atlas-fg-default); }",
+        ):
+            self.assertIn(expected, style)
+
+    def test_the_accent_is_never_body_text_and_the_success_pair_is_not_text(self) -> None:
+        style = style_block(self.dark_document)
+
+        # The accent is a background for the current-mode pill, and the light
+        # success pair is 3.38:1, so it is drawn as a marker, not as status text.
+        self.assertIn(
+            ".theme-current", style
+        )
+        self.assertNotIn("color: var(--atlas-accent)", style)
+        self.assertNotIn("color: var(--atlas-success-fg)", style)
+        self.assertIn('class="status status-good"', self.dark_document)
+
+    def test_default_and_unusable_themes_render_light(self) -> None:
+        for path in ("/", "/?theme=", "/?theme=sepia", "/?theme=DARK", "/?theme=a%20b"):
+            with self.subTest(path=path):
+                self.assertIn(
+                    '<html lang="en" data-theme="light">', self.get(path)
+                )
+
+    def test_the_repeated_theme_parameter_takes_the_last_value(self) -> None:
+        self.assertIn(
+            '<html lang="en" data-theme="dark">', self.get("/?theme=light&theme=dark")
+        )
+
+    def test_the_header_offers_the_other_mode(self) -> None:
+        self.assertIn('href="/?theme=dark">dark mode</a>', self.document)
+        self.assertIn('<span class="theme-current">light mode</span>', self.document)
+        self.assertIn('href="/?theme=light">light mode</a>', self.dark_document)
+        self.assertIn('<span class="theme-current">dark mode</span>', self.dark_document)
+
+    def test_a_mode_switch_is_still_a_terse_plain_document(self) -> None:
+        for document in (self.document, self.dark_document):
+            self.assertNotIn("<script", document)
+            self.assertNotIn("<link", document)
+            self.assertEqual(parse_html(document).unbalanced, [])
+            for attribute in re.findall(r'(?:src|href)="(https?://[^"]+)"', document):
+                self.assertTrue(
+                    attribute.startswith("https://images.unsplash.com/"), attribute
+                )
+
+    def test_normalise_theme_only_accepts_a_supplied_mode(self) -> None:
+        self.assertEqual(THEMES, ("light", "dark"))
+        self.assertEqual(DEFAULT_THEME, "light")
+        for requested in THEMES:
+            self.assertEqual(normalise_theme(requested), requested)
+        for unusable in (None, "", "Dark", "dark ", "light dark", 1, object()):
+            with self.subTest(requested=unusable):
+                self.assertEqual(normalise_theme(unusable), DEFAULT_THEME)
+
+    def test_render_console_theme_argument_is_optional(self) -> None:
+        catalog = self.server.catalog
+        business = self.server.business
+
+        self.assertEqual(
+            render_console(business, catalog),
+            render_console(business, catalog, DEFAULT_THEME),
+        )
+        self.assertEqual(
+            render_console(business, catalog, "dark"),
+            render_console(business, catalog, theme="dark"),
+        )
+        self.assertIn(
+            'data-theme="light"', render_console(business, catalog, "sepia")
+        )
+
+
+def _srgb(value: int) -> float:
+    channel = value / 255
+    return channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+
+
+def luminance(colour: str) -> float:
+    red, green, blue = (int(colour[index : index + 2], 16) for index in (1, 3, 5))
+    return 0.2126 * _srgb(red) + 0.7152 * _srgb(green) + 0.0722 * _srgb(blue)
+
+
+def contrast(fg: str, bg: str) -> float:
+    lighter, darker = sorted((luminance(fg), luminance(bg)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+# Every text pair the stylesheet actually paints, as (token, background) role
+# names resolved through the token table, so the check follows the tokens rather
+# than restating hex values.
+PAINTED_TEXT = {
+    "body on canvas": ("--atlas-fg-default", "--atlas-bg-canvas"),
+    "body on surface": ("--atlas-fg-default", "--atlas-bg-surface"),
+    "muted on canvas": ("--atlas-fg-muted", "--atlas-bg-canvas"),
+    "link on canvas": ("--atlas-link", "--atlas-bg-canvas"),
+    "on accent": ("--atlas-on-accent", "--atlas-accent"),
+    "warning": ("--atlas-warning-fg", "--atlas-warning-bg"),
+    "danger": ("--atlas-danger-fg", "--atlas-danger-bg"),
+    "info chip": ("--atlas-info-fg", "--atlas-info-bg"),
+}
+# Borders and focus rings that carry meaning are non-text UI, so WCAG 1.4.11
+# asks for 3:1.  ``border.divider`` and the chip's own border are decorative by
+# contract and exempt: a divider only separates content, and a chip is already
+# identified by its fill and its 15:1 label.
+PAINTED_NON_TEXT = {
+    "focus ring on canvas": ("--atlas-focus-ring", "--atlas-bg-canvas"),
+    "status border on canvas": ("--atlas-border-control", "--atlas-bg-canvas"),
+}
+
+
+class ThemeContrastTests(unittest.TestCase):
+    """WCAG AA for the pairs the console paints, in both modes."""
+
+    def _ratios(self, mode: int) -> dict[str, float]:
+        values = {name: pair[mode] for name, pair in TOKENS.items()}
+        return {
+            role: contrast(values[fg], values[bg])
+            for roles in (PAINTED_TEXT, PAINTED_NON_TEXT)
+            for role, (fg, bg) in roles.items()
+        }
+
+    def test_text_pairs_meet_aa_in_both_modes(self) -> None:
+        for mode, name in enumerate(THEMES):
+            for role, ratio in self._ratios(mode).items():
+                threshold = 4.5 if role in PAINTED_TEXT else 3.0
+                with self.subTest(mode=name, role=role):
+                    self.assertGreaterEqual(
+                        ratio, threshold, f"{name} {role} is {ratio:.2f}:1"
+                    )
+
+    def test_the_dark_muted_token_is_only_safe_on_the_canvas(self) -> None:
+        # The contract derived fg.muted against bg.canvas.  In dark mode it clears
+        # AA there and misses it on the surface, which is the whole reason the
+        # stylesheet keeps the muted token off cards and tiles.
+        values = {token: pair[THEMES.index("dark")] for token, pair in TOKENS.items()}
+
+        self.assertGreaterEqual(
+            contrast(values["--atlas-fg-muted"], values["--atlas-bg-canvas"]), 4.5
+        )
+        self.assertLess(
+            contrast(values["--atlas-fg-muted"], values["--atlas-bg-surface"]), 4.5
+        )
 
 
 class HtmlEscapingTests(unittest.TestCase):
