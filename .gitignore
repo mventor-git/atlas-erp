@@ -1,0 +1,9 @@
+# Python bytecode caches.
+__pycache__/
+*.pyc
+
+# Local secrets, e.g. a database URL in ATLAS_ERP_DATABASE_URL.
+.env
+
+# Local database files, e.g. pg_dump output. db/*.sql is versioned on purpose.
+*.dump
