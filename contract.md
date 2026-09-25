@@ -3,7 +3,7 @@
 ## Metadata
 
 - Product: Atlas ERP
-- Contract version: 1.0.0
+- Contract version: 1.1.0
 - Status: ACTIVE
 - Date: 2026-09-25
 - Approval date: 2026-09-25
@@ -60,6 +60,33 @@ runtime dependency.
 Connect is share-only by default. Adoption or import of data owned by another
 application is a separate, explicit operation.
 
+## Design tokens
+
+Presentation uses a shared Atlas UI palette, exposed as named tokens or CSS
+variables. The token names and values are the same on every Atlas product
+surface, so a surface moved between products keeps its appearance.
+
+| Token | Mode | Value |
+| --- | --- | --- |
+| background | light | `#F7F2EB` |
+| surface | light | `#EAE2D6` |
+| border | light | `#EEEEEE` |
+| accent | light | `#8B9A6E` |
+| text | light | `#41444B` |
+| background | dark | `#41444B` |
+| surface | dark | `#52575D` |
+| accent | dark | `#CABFAB` |
+| text | dark | `#F7F2EB` |
+| muted text | dark | `#DFD8C8` |
+
+- The accent is an accent, not body text on the light background.
+- `#EEEEEE` is a border/divider token and is not a text color.
+- Implementations expose the palette as named tokens or CSS variables, support
+  both light and dark modes, and keep text readable in both, targeting WCAG AA
+  contrast.
+- Tokens are overridable, and overriding one must not change what any value
+  means to the data.
+
 ## Data
 
 - Atlas ERP owns its PostgreSQL database, named `atlas_erp`.
@@ -80,6 +107,8 @@ application is a separate, explicit operation.
    the vendored protocol specification.
 4. **Authority:** the default is share-only, and any single-master adoption or
    import is explicit and unambiguous.
+5. **Design tokens:** the operator console renders the shared palette in light
+   and dark modes with readable contrast and token-based styling.
 
 ## Risks and unknowns
 
@@ -91,9 +120,13 @@ application is a separate, explicit operation.
   making Atlas ERP dependent on a peer.
 - Operational behavior during prolonged disconnection and resynchronization
   needs validation with representative data volumes.
+- The current demo console predates this contract's token requirement and must
+  not be presented as satisfying the design-token gate until it is tokenized
+  and verified.
 
 ## Amendment history
 
 | Version | Date | Change | Status |
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-09-25 | Initial approved standalone ERP contract, baseline clusters, database ownership, and embedded connect defaults. | ACTIVE |
+| 1.1.0 | 2026-09-25 | Approved shared Atlas UI palette and light/dark design-token contract. | ACTIVE |

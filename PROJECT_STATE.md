@@ -61,6 +61,12 @@ The console slice left no server behind either. `tests/test_web.py` starts `WebS
 
 ## Explicitly deferred
 
+- Design tokens. `contract.md` is now at v1.1.0, which adds the shared Atlas UI
+  palette, light/dark support, and a design-token acceptance gate; that is a
+  documentation-only amendment and no code changed with it. The console in
+  `atlas_erp/web.py` predates the requirement: it carries its own inline colors
+  and no light/dark mode, so it must not be reported as satisfying that gate
+  until the palette is applied as named tokens and checked in both modes.
 - The operator console is a read-only demo, so acceptance gate 2 is not met. `atlas_erp/web.py` renders fixture and in-memory state and offers no write surface at all: an operator cannot create, edit, receive, or acknowledge anything from the browser, and there is no authentication, no session, no CSRF token, and no audit of who looked. Anything a browser could change today would change only state a restart discards. A real console needs the ERP-owned database first, then an authenticated operator write path.
 - Full ERP persistence. Only the command receipt is durable. The item master, stock, sales, journals, audit history, and the protocol adapter all remain in memory and are lost on restart, so duplicate-sale *detection* survives a restart but the sale itself does not: a retried `sale_id` after a restart replays the original `201` receipt while the audit snapshot no longer contains that sale, and the peer's sale id now points at a sale ERP has forgotten. A real `atlas_erp` database per the contract's ownership rule, durable inbox/outbox, and durable audit history are not implemented. The console makes this visible rather than fixing it: the page it renders is gone on exit.
 - The real `atlas_erp` schema. `db/schema.sql` is explicitly not it: every object is `example_`-prefixed example data, there is no migration runner, no migration history, and no down-migration, and no code reads those tables. Building the contract's ERP-owned schema and pointing the business domain at it is a later decision, not something this dataset does.
