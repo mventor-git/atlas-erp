@@ -3,7 +3,7 @@
 ## Metadata
 
 - Product: Atlas ERP
-- Contract version: 1.1.1
+- Contract version: 1.2.0
 - Status: ACTIVE
 - Date: 2026-09-25
 - Approval date: 2026-09-25
@@ -116,6 +116,50 @@ replaceable and the token contract is authoritative.
   3.38:1. It is preserved as supplied and is for non-text and large-text use
   only; for normal text on that background, pair it with `#2D0000` instead.
 
+## UI implementation direction
+
+The approved frontend direction for the operator console is React 19 +
+TypeScript + Vite + Tailwind CSS v4 + shadcn/ui on Radix UI primitives.
+shadcn components are copied into this product's source tree and owned here,
+not consumed as a shared runtime package, so a product never depends on
+another product's components to build.
+
+- The console is a separate frontend build with its own dependencies and build
+  output. The existing Python API and its routes are unchanged, `atlas_erp`
+  keeps sole ownership of its database, and the frontend reads that API as its
+  only data source.
+- The v1.1.1 token table above remains the semantic authority. shadcn and
+  Tailwind variables are a derived mapping onto that table, not a second
+  source of colour truth, and no component file contains a raw hex value.
+- The required mapping is fixed, so the two products stay visually identical
+  on shared surfaces:
+
+| shadcn / Tailwind variable | Shared token |
+| --- | --- |
+| `--background` | `--atlas-bg-canvas` (`bg.canvas`) |
+| `--foreground` | `--atlas-fg-default` (`fg.default`) |
+| `--card` | `--atlas-bg-surface` (`bg.surface`) |
+| `--primary` | `--atlas-accent` (`accent.default`) |
+| `--primary-foreground` | `--atlas-on-accent` (`onAccent.default`) |
+| `--muted-foreground` | `--atlas-fg-muted` (`fg.muted`), canvas use only |
+| `--border` | `--atlas-border-divider` (`border.divider`) |
+| `--input` | `--atlas-border-control` (`border.control`) |
+| `--ring` | `--atlas-focus-ring` (`focus.ring`) |
+
+- The four shadcn state variables (`--success`, `--warning`, `--danger`,
+  `--info`) resolve to the `state.*` token pairs above, as a foreground on a
+  background. Within `state.success`, `state.success.text` uses the accessible
+  ink `#2D0000` in both modes, because the supplied light foreground
+  `#2A7C13` on `#C7D3C0` is 3.38:1 and is not a normal-text pair, and
+  `state.success.indicator` is the non-text marker carrying the supplied
+  foreground.
+- Light and dark mode, `:focus-visible` behavior driven by `focus.ring`,
+  keyboard operability of every interactive component, and WCAG AA in both
+  modes are required, not optional.
+- Adopting shadcn/ui is an implementation direction for the frontend only. It
+  is not permission to rewrite the backend, to move domain logic into the
+  browser, or to share a database with another product.
+
 ## Data
 
 - Atlas ERP owns its PostgreSQL database, named `atlas_erp`.
@@ -142,6 +186,12 @@ replaceable and the token contract is authoritative.
    color, focus ring, and state pair resolves to the named token rather than to
    a hard-coded color, and text and controls meet WCAG AA in both modes. The
    component foundation behind the markup is not fixed by this gate.
+6. **Operator console frontend:** the operator console is a separate Vite +
+   React + TypeScript frontend build that uses the approved shadcn/ui and
+   Tailwind CSS v4 direction, resolves the shared token table above through the
+   required shadcn variable mapping in both light and dark mode with no raw hex
+   value in a component, and reads every value it displays from the Python API,
+   which stays its only data source.
 
 ## Risks and unknowns
 
@@ -153,12 +203,24 @@ replaceable and the token contract is authoritative.
   making Atlas ERP dependent on a peer.
 - Operational behavior during prolonged disconnection and resynchronization
   needs validation with representative data volumes.
-- The current demo console is not tokenized: it predates this contract's token
-  table, carries its own inline colors, and has no light/dark mode, so it must
-  not be presented as satisfying the design-token gate until it is tokenized
-  and verified in both modes.
+- The current demo console demonstrates the shared tokens and light/dark
+  behavior at the token level, but it is a server-rendered demo with no build
+  step, so it does not satisfy the new separate Vite/React/shadcn frontend gate
+  until it is migrated.
 - The light `state.success` pair `#2A7C13` on `#C7D3C0` is 3.38:1 and is not a
   normal-text pair; normal text on that background has to use `#2D0000`.
+- The approved console direction adds a Node build surface to a product whose
+  Python package deliberately has no build step and no runtime third-party
+  import on its standalone paths. A lockfile, a dependency tree, and generated
+  build output have to be kept out of the standalone import and test path.
+- shadcn components are generated into this product's source tree and into the
+  sibling product's tree separately, so the same component exists twice and can
+  drift. A shadcn upgrade or a local component edit has to be applied
+  deliberately per product, and there is no shared package to upgrade once.
+- Nothing checks token parity between the two products. If either shadcn
+  variable mapping is edited and the other is not, the surfaces diverge with
+  no failing check, so parity needs a check that resolves both mappings to the
+  shared token values in both modes.
 
 ## Amendment history
 
@@ -167,3 +229,4 @@ replaceable and the token contract is authoritative.
 | 1.0.0 | 2026-09-25 | Initial approved standalone ERP contract, baseline clusters, database ownership, and embedded connect defaults. | ACTIVE |
 | 1.1.0 | 2026-09-25 | Approved shared Atlas UI palette and light/dark design-token contract. | ACTIVE |
 | 1.1.1 | 2026-09-25 | Expanded shared UI token table, derived contrast-safe values, and preferred shadcn/ui foundation. | ACTIVE |
+| 1.2.0 | 2026-09-25 | Approved React/Vite/Tailwind/shadcn frontend direction and token mapping for both products. | ACTIVE |
