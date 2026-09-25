@@ -3,7 +3,7 @@
 ## Metadata
 
 - Product: Atlas ERP
-- Contract version: 1.1.0
+- Contract version: 1.1.1
 - Status: ACTIVE
 - Date: 2026-09-25
 - Approval date: 2026-09-25
@@ -62,30 +62,59 @@ application is a separate, explicit operation.
 
 ## Design tokens
 
-Presentation uses a shared Atlas UI palette, exposed as named tokens or CSS
+Presentation uses a shared Atlas UI token set, exposed as named tokens or CSS
 variables. The token names and values are the same on every Atlas product
-surface, so a surface moved between products keeps its appearance.
+surface, so a surface moved between products keeps its appearance. The table
+below is the single shared reference: one name, one meaning, one value per
+mode, in both products.
 
-| Token | Mode | Value |
-| --- | --- | --- |
-| background | light | `#F7F2EB` |
-| surface | light | `#EAE2D6` |
-| border | light | `#EEEEEE` |
-| accent | light | `#8B9A6E` |
-| text | light | `#41444B` |
-| background | dark | `#41444B` |
-| surface | dark | `#52575D` |
-| accent | dark | `#CABFAB` |
-| text | dark | `#F7F2EB` |
-| muted text | dark | `#DFD8C8` |
+| Token | Role | Light | Dark |
+| --- | --- | --- | --- |
+| `bg.canvas` | Page background | `#F7F2EB` | `#41444B` |
+| `bg.surface` | Card/surface | `#EAE2D6` | `#52575D` |
+| `fg.default` | Body text | `#2D0000` | `#DFD8C8` |
+| `fg.muted` | Muted text | `#6A2F2F` (derived) | `#B7B3A9` (derived) |
+| `accent.default` | Accent | `#8B9A6E` | `#CABFAB` |
+| `link.default` | Link | `#2D0000` + underline | `#DFD8C8` + underline |
+| `border.divider` | Divider | `#EEEEEE` | `#52575D` |
+| `border.control` | Control border | `#757D6F` | `#9AA394` (derived) |
+| `onAccent.default` | Text on accent | `#2D0000` | `#41444B` |
+| `focus.ring` | Focus ring | `#2D0000` | `#DFD8C8` |
+| `state.success` | Success | `#2A7C13` on `#C7D3C0` | `#2D0000` on `#C7D3C0` |
+| `state.warning` | Warning | `#2D0000` on `#C8A96B` | `#2D0000` on `#C8A96B` |
+| `state.danger` | Danger | `#6D0808` on `#FFDADA` | `#2D0000` on `#FFDADA` |
+| `state.info` | Info | `#2D0000` on `#FBE6C2` | `#2D0000` on `#FBE6C2` |
 
-- The accent is an accent, not body text on the light background.
-- `#EEEEEE` is a border/divider token and is not a text color.
-- Implementations expose the palette as named tokens or CSS variables, support
-  both light and dark modes, and keep text readable in both, targeting WCAG AA
-  contrast.
+### Token mapping
+
+- `accent.default` is an accent and is never body text on `bg.canvas`; body
+  text is `fg.default` only.
+- `link.default` carries an underline and does not rely on color alone.
+- `border.divider` is decorative and low-contrast by design; it separates
+  content and is never a text color.
+- `focus.ring` must stay visible on the surface it is drawn on, and is
+  applied to every keyboard-focusable control.
+- Each `state.*` token is a foreground-on-background pair and is used as
+  supplied.
 - Tokens are overridable, and overriding one must not change what any value
   means to the data.
+
+### Component foundation
+
+shadcn/ui (Radix/Base UI + Tailwind) is the preferred component foundation
+because it consumes CSS variables and preserves markup ownership; it is
+replaceable and the token contract is authoritative.
+
+### Contrast
+
+- The target is WCAG AA in both light and dark mode.
+- Three values are derived rather than supplied, and are the ones the contrast
+  check returned: light `fg.muted` `#6A2F2F` (9.15:1 on `#F7F2EB`), dark
+  `fg.muted` `#B7B3A9` (4.66:1 on `#41444B`), and dark `border.control`
+  `#9AA394` (3.73:1 on `#41444B`). Every other value is as supplied.
+- Caveat: the light `state.success` pair `#2A7C13` on `#C7D3C0` measures
+  3.38:1. It is preserved as supplied and is for non-text and large-text use
+  only; for normal text on that background, pair it with `#2D0000` instead.
 
 ## Data
 
@@ -107,8 +136,12 @@ surface, so a surface moved between products keeps its appearance.
    the vendored protocol specification.
 4. **Authority:** the default is share-only, and any single-master adoption or
    import is explicit and unambiguous.
-5. **Design tokens:** the operator console renders the shared palette in light
-   and dark modes with readable contrast and token-based styling.
+5. **Design tokens:** the operator console is styled from the shared token
+   table above in both light and dark mode. Every background, surface, body
+   and muted text color, accent, link, divider, control border, on-accent
+   color, focus ring, and state pair resolves to the named token rather than to
+   a hard-coded color, and text and controls meet WCAG AA in both modes. The
+   component foundation behind the markup is not fixed by this gate.
 
 ## Risks and unknowns
 
@@ -120,9 +153,12 @@ surface, so a surface moved between products keeps its appearance.
   making Atlas ERP dependent on a peer.
 - Operational behavior during prolonged disconnection and resynchronization
   needs validation with representative data volumes.
-- The current demo console predates this contract's token requirement and must
+- The current demo console is not tokenized: it predates this contract's token
+  table, carries its own inline colors, and has no light/dark mode, so it must
   not be presented as satisfying the design-token gate until it is tokenized
-  and verified.
+  and verified in both modes.
+- The light `state.success` pair `#2A7C13` on `#C7D3C0` is 3.38:1 and is not a
+  normal-text pair; normal text on that background has to use `#2D0000`.
 
 ## Amendment history
 
@@ -130,3 +166,4 @@ surface, so a surface moved between products keeps its appearance.
 | --- | --- | --- | --- |
 | 1.0.0 | 2026-09-25 | Initial approved standalone ERP contract, baseline clusters, database ownership, and embedded connect defaults. | ACTIVE |
 | 1.1.0 | 2026-09-25 | Approved shared Atlas UI palette and light/dark design-token contract. | ACTIVE |
+| 1.1.1 | 2026-09-25 | Expanded shared UI token table, derived contrast-safe values, and preferred shadcn/ui foundation. | ACTIVE |

@@ -32,9 +32,9 @@ The numbers below are for the latest run, which includes the console slice. The 
 - `pyright` — 0 errors, 0 warnings, 0 informations.
 - AST validation — 15 Python files passed (the three new files included).
 - `python -B tests/cross_process_smoke.py` — not rerun for the console slice, because it needs the peer database that no longer exists. The last result, from the published commit, was: passed from this repository, real processes over real HTTP with a real peer database. Read smoke passed first, then the connected checkout, then the lower-level order smoke. The checkout smoke is the durable proof and fails on any of: an ERP audit cursor that does not advance after the sale, stock that does not fall by exactly the submitted quantity, a repeated Ecom key not answered from the stored receipt, a replayed order whose id or `sale_id` differs from the first, an ERP audit cursor that *does* move on the replay, stock that changed on the replay, or anything other than exactly one connected order in the Ecom `OrderBook`. Its JSON reports `durable_replay: true`, `replayed: true`, and `order_store: "postgres"`. The smoke fixture it drives is deterministic: item `item-1` at 1250 cents, 5 units received, 1 pre-sold, leaving 4 units for the two guarded clients.
-- `git status --short --branch` — `## main...origin/main` with no ahead/behind count, so the branch is published and in step with `origin/main`, but the working tree is **not** clean: this console slice is uncommitted, with `atlas_erp/demo_catalog.py`, `atlas_erp/web.py`, and `tests/test_web.py` untracked. The tracked set is still the same 20 files and this slice modifies none of them: `.gitignore`, `PROJECT_STATE.md`, `atlas_erp/`, `connect/`, `contract.md`, `db/`, `pyproject.toml`, `tests/`. Nothing in this slice is reviewable against a commit until it is added and committed.
+- `git status --short --branch` — `## main...origin/main` with no ahead/behind count, so the branch is published and in step with `origin/main`, but the working tree is **not** clean: this console slice is uncommitted, with `atlas_erp/demo_catalog.py`, `atlas_erp/web.py`, and `tests/test_web.py` untracked. The tracked set is still the same 20 files and this slice modifies none of them: `.gitignore`, `PROJECT_STATE.md`, `atlas_erp/`, `connect/`, `contract.md`, `db/`, `pyproject.toml`, `tests/`. Nothing in this slice is reviewable against a commit until it is added and committed. Superseded by a later re-check: this slice was committed as `844df66` and the v1.1.0 amendment as `3f234cc`, and the only uncommitted changes are now `contract.md` and this file, both from the v1.1.1 amendment.
 - `git diff --check` — no whitespace errors reported, and with the tree tracked this check now actually covers the sources. Whitespace was verified directly as well: 0 trailing-whitespace lines, 0 hard CRs, 0 tabs, and a final newline.
-- `contract.md` and `connect/SPEC.md` were not modified by this slice.
+- `contract.md` and `connect/SPEC.md` were not modified by this slice. Since that run, the v1.1.1 design-token amendment has modified `contract.md` and this file in the working tree, still uncommitted; `connect/SPEC.md` is untouched and no source file changed with it.
 
 ## Verification recorded for the example database
 
@@ -61,12 +61,19 @@ The console slice left no server behind either. `tests/test_web.py` starts `WebS
 
 ## Explicitly deferred
 
-- Design tokens. `contract.md` is now at v1.1.0, which adds the shared Atlas UI
-  palette, light/dark support, and a design-token acceptance gate; that is a
-  documentation-only amendment and no code changed with it. The console in
-  `atlas_erp/web.py` predates the requirement: it carries its own inline colors
-  and no light/dark mode, so it must not be reported as satisfying that gate
-  until the palette is applied as named tokens and checked in both modes.
+- Design tokens. `contract.md` is now at v1.1.1, which replaces the short palette
+  section with the full shared Atlas UI token table (`bg.canvas`, `bg.surface`,
+  `fg.default`, `fg.muted`, `accent.default`, `link.default`,
+  `border.divider`, `border.control`, `onAccent.default`, `focus.ring`, and the
+  four `state.*` pairs) in light and dark, records the three derived
+  contrast-safe values and the light `state.success` 3.38:1 caveat, and names
+  shadcn/ui as the preferred but replaceable component foundation. The
+  design-token gate is unchanged in intent and now checks the token table in
+  both modes. Both the v1.1.0 and v1.1.1 amendments are documentation-only and
+  no code changed with either. The console in `atlas_erp/web.py` is still not
+  tokenized: it carries its own inline colors and no light/dark mode, so it
+  must not be reported as satisfying that gate until the token table is applied
+  as named tokens and checked in both modes.
 - The operator console is a read-only demo, so acceptance gate 2 is not met. `atlas_erp/web.py` renders fixture and in-memory state and offers no write surface at all: an operator cannot create, edit, receive, or acknowledge anything from the browser, and there is no authentication, no session, no CSRF token, and no audit of who looked. Anything a browser could change today would change only state a restart discards. A real console needs the ERP-owned database first, then an authenticated operator write path.
 - Full ERP persistence. Only the command receipt is durable. The item master, stock, sales, journals, audit history, and the protocol adapter all remain in memory and are lost on restart, so duplicate-sale *detection* survives a restart but the sale itself does not: a retried `sale_id` after a restart replays the original `201` receipt while the audit snapshot no longer contains that sale, and the peer's sale id now points at a sale ERP has forgotten. A real `atlas_erp` database per the contract's ownership rule, durable inbox/outbox, and durable audit history are not implemented. The console makes this visible rather than fixing it: the page it renders is gone on exit.
 - The real `atlas_erp` schema. `db/schema.sql` is explicitly not it: every object is `example_`-prefixed example data, there is no migration runner, no migration history, and no down-migration, and no code reads those tables. Building the contract's ERP-owned schema and pointing the business domain at it is a later decision, not something this dataset does.
