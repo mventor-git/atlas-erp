@@ -38,6 +38,12 @@ const TOKENS = [
   "--atlas-focus-ring",
   "--atlas-success-fg",
   "--atlas-success-bg",
+  // The contract's one named deviation, not contract-supplied values: the
+  // accessible ink in both modes, and the supplied foreground kept as the
+  // non-text indicator. Both products declare them, and the ERP dark badge
+  // defect lived in exactly this pair, so parity has to cover it.
+  "--atlas-success-text",
+  "--atlas-success-indicator",
   "--atlas-warning-fg",
   "--atlas-warning-bg",
   "--atlas-danger-fg",

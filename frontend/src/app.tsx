@@ -40,10 +40,14 @@ export function ConsolePage() {
   const audit = useResource(useCallback(() => fetchAudit(), []));
 
   return (
-    <div className="mx-auto grid w-full max-w-7xl gap-6 p-4 lg:p-6">
+    // minmax(0,1fr) on both grids: a grid item defaults to min-width auto, so the
+    // wide catalogue table would size its column to max-content and overflow the
+    // max-w-7xl instead of reaching the table's own overflow-x-auto, which clipped
+    // three columns. A zero minimum is what lets the scroll container take effect.
+    <div className="mx-auto grid w-full max-w-7xl grid-cols-[minmax(0,1fr)] gap-6 p-4 lg:p-6">
       <ConsoleHeader health={health} />
 
-      <main className="grid gap-6">
+      <main className="grid grid-cols-[minmax(0,1fr)] gap-6">
         <AsyncSection resource={overview(catalog, audit)} label="key figures">
           {({ catalog: data, audit: snapshot }) => <KpiTiles tiles={kpiTiles(data, snapshot)} />}
         </AsyncSection>

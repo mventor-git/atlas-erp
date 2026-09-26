@@ -48,9 +48,12 @@ function CardDescription({ className, ...props }: React.ComponentProps<"div">) {
   );
 }
 
+// min-w-0 because Card is a flex column and a flex item defaults to min-width
+// auto: without it the content refuses to shrink, so a wide table inside never
+// reaches its own overflow-x-auto and is clipped at the card edge instead.
 function CardContent({ className, ...props }: React.ComponentProps<"div">) {
   return (
-    <div data-slot="card-content" className={cn("px-4", className)} {...props} />
+    <div data-slot="card-content" className={cn("min-w-0 px-4", className)} {...props} />
   );
 }
 

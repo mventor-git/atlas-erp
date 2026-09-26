@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Atlas ERP">
+  <title>Atlas ERP</title>
+  <!--
+    Token-independent on purpose. A favicon is painted by the browser outside
+    this document, so it cannot resolve var(--atlas-*); using currentColor keeps
+    the mark a single ink that follows the browser's own chrome in both modes
+    instead of freezing one mode's palette into a committed file.
+  -->
+  <path
+    d="M16 2 30 9v14L16 30 2 23V9z"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2.5"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M11 21V11l10 10V11"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

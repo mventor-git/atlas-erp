@@ -31,6 +31,17 @@ const TOKENS: Record<string, [string, string]> = {
   "--atlas-info-bg": ["#fbe6c2", "#fbe6c2"],
 };
 
+/**
+ * The contract's one named deviation, kept as its own table because it is not a
+ * value the contract supplies: `state.success.text` is the accessible ink in
+ * both modes, and the supplied foreground survives as the non-text indicator.
+ * These are the tokens that deviation resolves to.
+ */
+const SUCCESS_ROLE: Record<string, [string, string]> = {
+  "--atlas-success-text": ["#2d0000", "#2d0000"],
+  "--atlas-success-indicator": ["#2a7c13", "#2d0000"],
+};
+
 /** The mapping contract.md v1.2.0 fixes; a component may only use these. */
 const MAPPING: Record<string, string> = {
   "--background": "--atlas-bg-canvas",
@@ -44,7 +55,8 @@ const MAPPING: Record<string, string> = {
   "--ring": "--atlas-focus-ring",
   "--link": "--atlas-link",
   "--success-bg": "--atlas-success-bg",
-  "--success-indicator": "--atlas-success-fg",
+  "--success-text": "--atlas-success-text",
+  "--success-indicator": "--atlas-success-indicator",
   "--warning-bg": "--atlas-warning-bg",
   "--warning-text": "--atlas-warning-fg",
   "--danger-bg": "--atlas-danger-bg",
@@ -82,6 +94,57 @@ function declared(css: string): Map<string, string> {
   );
 }
 
+/** WCAG 2.x relative luminance. Same formula as the sibling product's check. */
+function luminance(hex: string): number {
+  const channels = [1, 3, 5].map((offset) => Number.parseInt(hex.slice(offset, offset + 2), 16) / 255);
+  const [red, green, blue] = channels.map((value) =>
+    value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4,
+  );
+  return 0.2126 * (red ?? 0) + 0.7152 * (green ?? 0) + 0.0722 * (blue ?? 0);
+}
+
+/** WCAG 2.x contrast ratio, order-independent. */
+function contrast(a: string, b: string): number {
+  const [high, low] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (high + 0.05) / (low + 0.05);
+}
+
+/**
+ * Every declaration in every `:root` rule. The mapping block follows the token
+ * block in source order, so merging them and letting the last write win is the
+ * cascade, and it is what lets `resolve` start at a shadcn variable.
+ */
+function mapped(): Map<string, string> {
+  const found = new Map<string, string>();
+  for (const [, body] of CSS.matchAll(/:root\s*(?:,[^{]*)?\{([^}]*)\}/g)) {
+    for (const [, name, value] of (body ?? "").matchAll(/(--[a-z-]+):\s*([^;]+);/g)) {
+      found.set(name as string, (value as string).trim());
+    }
+  }
+  return found;
+}
+
+/**
+ * Follow a shadcn variable to the colour it actually paints with in one mode.
+ *
+ * This is the whole point of the assertions below. Asserting that
+ * `--success-text` is *wired* to some token proves the wiring; it says nothing
+ * about what a reader sees. Resolving the chain to the hex that mode declares
+ * and measuring that is the only version of this check that can fail when the
+ * page is unreadable.
+ */
+function resolve(name: string, mode: "light" | "dark"): string {
+  const table = declared(mode === "light" ? LIGHT : DARK);
+  const chain = mapped();
+  let value = chain.get(name) ?? "";
+  for (let hop = 0; hop < 4; hop++) {
+    const next = /^var\((--[a-z-]+)\)$/.exec(value)?.[1];
+    if (!next) break;
+    value = table.get(next) ?? chain.get(next) ?? "";
+  }
+  return value;
+}
+
 function sourceFiles(directory: string): string[] {
   return readdirSync(directory).flatMap((entry) => {
     const path = join(directory, entry);
@@ -91,18 +154,20 @@ function sourceFiles(directory: string): string[] {
 }
 
 describe("token bridge", () => {
-  it("declares all 18 contract tokens in the light block, once each", () => {
+  it("declares the 18 contract tokens and the success role in the light block, once each", () => {
     const values = declared(LIGHT);
-    expect([...values.keys()].sort()).toEqual(Object.keys(TOKENS).sort());
-    for (const [name, [light]] of Object.entries(TOKENS)) {
+    const expected = { ...TOKENS, ...SUCCESS_ROLE };
+    expect([...values.keys()].sort()).toEqual(Object.keys(expected).sort());
+    for (const [name, [light]] of Object.entries(expected)) {
       expect(values.get(name), name).toBe(light);
     }
   });
 
-  it("declares all 18 contract tokens in the dark block, once each", () => {
+  it("declares the 18 contract tokens and the success role in the dark block, once each", () => {
     const values = declared(DARK);
-    expect([...values.keys()].sort()).toEqual(Object.keys(TOKENS).sort());
-    for (const [name, [, dark]] of Object.entries(TOKENS)) {
+    const expected = { ...TOKENS, ...SUCCESS_ROLE };
+    expect([...values.keys()].sort()).toEqual(Object.keys(expected).sort());
+    for (const [name, [, dark]] of Object.entries(expected)) {
       expect(values.get(name), name).toBe(dark);
     }
   });
@@ -119,11 +184,31 @@ describe("token bridge", () => {
     }
   });
 
-  it("keeps state.success text on the accessible ink, not the 3.38:1 foreground", () => {
-    // The contract's one deviation: normal text on state.success.bg uses the
-    // body ink, and the supplied foreground stays the non-text indicator.
-    expect(CSS).toMatch(/--success-text:\s*var\(--atlas-fg-default\)/);
-    expect(CSS).toMatch(/--success-indicator:\s*var\(--atlas-success-fg\)/);
+  it("keeps state.success text at AA on its own background in both modes", () => {
+    // The contract's one deviation, checked as the outcome rather than the wiring.
+    // The supplied success foreground is 3.38:1 on state.success.bg, so the text
+    // token resolves to the accessible ink while the indicator keeps it. Reading
+    // the resolved pair is what a reader actually gets; the previous version of
+    // this test asserted the variable's wiring and stayed green on a 1.10:1 badge.
+    for (const mode of ["light", "dark"] as const) {
+      const foreground = resolve("--success-text", mode);
+      const background = resolve("--success-bg", mode);
+      const ratio = contrast(foreground, background);
+      expect(foreground, `${mode}: --success-text resolved to nothing`).toMatch(/^#[0-9a-f]{6}$/);
+      expect(
+        ratio,
+        `${mode}: state.success text ${foreground} on ${background} measures ${ratio.toFixed(2)}:1`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  it("never paints state.success text with the body ink, which is 1.10:1 in dark", () => {
+    // The exact regression, named so the failure says what happened: pointing
+    // --success-text back at --atlas-fg-default is invisible on state.success.bg
+    // in dark mode. In light the two are the same colour, so only dark separates
+    // them, and this is the assertion that fails if the wiring is undone.
+    expect(resolve("--success-text", "dark")).not.toBe(resolve("--foreground", "dark"));
+    expect(CSS).toMatch(/--success-indicator:\s*var\(--atlas-success-indicator\)/);
   });
 
   it("makes the muted token and control border surface-safe", () => {

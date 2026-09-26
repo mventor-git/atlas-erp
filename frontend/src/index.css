@@ -35,6 +35,8 @@
   --atlas-danger-bg: #ffdada;
   --atlas-info-fg: #2d0000;
   --atlas-info-bg: #fbe6c2;
+  --atlas-success-text: #2d0000;
+  --atlas-success-indicator: #2a7c13;
 }
 
 /* --- contract.md v1.1.1, dark mode -------------------------------------- */
@@ -58,6 +60,8 @@
   --atlas-danger-bg: #ffdada;
   --atlas-info-fg: #2d0000;
   --atlas-info-bg: #fbe6c2;
+  --atlas-success-text: #2d0000;
+  --atlas-success-indicator: #2d0000;
 }
 
 /* --- contract.md v1.2.0 required shadcn -> Atlas mapping ---------------- */
@@ -81,13 +85,15 @@
   --ring: var(--atlas-focus-ring);
   --link: var(--atlas-link);
 
-  /* Each state is a foreground-on-background pair, used as supplied.
-     state.success is the one exception the contract names: the supplied light
-     foreground on state.success.bg is 3.38:1, so normal text uses the accessible
-     ink and the supplied foreground stays the non-text indicator. */
+  /* Each state is a foreground-on-background pair. state.success is the one
+     deviation the contract names, and it is a deviation in the *text* token
+     only: the supplied success foreground is 3.38:1 on state.success.bg, so
+     normal text resolves through --atlas-success-text in BOTH modes and the
+     supplied foreground stays the non-text indicator. Declaring it per mode is
+     what makes that testable: the resolved pair is measured, not assumed. */
   --success-bg: var(--atlas-success-bg);
-  --success-text: var(--atlas-fg-default);
-  --success-indicator: var(--atlas-success-fg);
+  --success-text: var(--atlas-success-text);
+  --success-indicator: var(--atlas-success-indicator);
   --warning-bg: var(--atlas-warning-bg);
   --warning-text: var(--atlas-warning-fg);
   --danger-bg: var(--atlas-danger-bg);
