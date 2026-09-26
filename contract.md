@@ -3,10 +3,10 @@
 ## Metadata
 
 - Product: Atlas ERP
-- Contract version: 1.2.0
+- Contract version: 1.3.0
 - Status: ACTIVE
-- Date: 2026-09-25
-- Approval date: 2026-09-25
+- Date: 2026-09-26
+- Approval date: 2026-09-26
 
 ## Vision
 
@@ -21,6 +21,27 @@ Atlas ERP was lifted out of Atlas HQ because it can perform as a standalone
 application. It is an independent product boundary, not a mode or optional
 module of Atlas HQ. The intended implementation is Python, but no Python
 implementation is included in this first version.
+
+## Legacy knowledge transfer
+
+The legacy `ecom-erp` project is the evidence base for this contract, not its
+authority. It is a read-only reference: this product takes no code, schema,
+route, or UI from it.
+
+- Adopt: the invariants, requirements, and tests a legacy area proved. Each is
+  restated here as a contract of this product and, where it is a rule, as a test
+  that runs in this repository.
+- Redesign: the mechanism behind each adopted requirement is designed inside
+  `core -> cluster -> plugin -> module` in this product, against this
+  product's own database and console. A legacy implementation is never carried
+  over.
+- Drop: legacy accidents. Competing sources of truth, unnormalized order
+  payloads, mutable money, status-only settlement, per-process caches, and
+  inline migration hacks are known defects and are not inherited.
+- No source, schema, route, or UI copy is permitted, and no legacy table is
+  read, imported, or migrated. Legacy data is still not imported.
+- Where a legacy behavior is ambiguous, this contract decides and the legacy
+  repository is cited as evidence for the requirement only.
 
 ## Goals
 
@@ -60,6 +81,29 @@ runtime dependency.
 Connect is share-only by default. Adoption or import of data owned by another
 application is a separate, explicit operation.
 
+## Evolution map
+
+This map names candidate modules only. It adds no cluster, no product
+boundary, and no dependency, and a candidate is not approved scope.
+
+| Cluster | Candidate modules | Status |
+| --- | --- | --- |
+| `finance` | `journal` (balanced entries, posted-only truth), `period` (open and
+  close, fail-closed while closed), `reconciliation` (operational state against
+  posted journals) | candidate |
+| `inventory` | `movement` (ledger of every quantity change), `valuation` (cost
+  captured per movement, never restated), `replay` (rebuild state from
+  movements) | candidate |
+| `purchasing` | `numbering` (document sequences per document kind), `import`
+  (external purchase data into purchasing) | candidate |
+| pricing, operations | price lists, markup, and cost policy; picking, packing, and
+  delivery | candidate decision, not active scope |
+
+The requirements behind these candidates are the ones adopted from legacy
+knowledge; the mechanisms are not. Nothing in this table is approved scope until
+an amendment promotes it, and a promoted module still ships only against the
+transfer gate below.
+
 ## Design tokens
 
 Presentation uses a shared Atlas UI token set, exposed as named tokens or CSS
@@ -98,6 +142,11 @@ mode, in both products.
   supplied.
 - Tokens are overridable, and overriding one must not change what any value
   means to the data.
+- Token parity is an acceptance requirement, checked across both products'
+  frontends: the single shared token table above is the reference, each
+  product's bridge resolves to it in both modes, no raw hex value exists
+  outside a product's token bridge, and a parity failure blocks the change
+  rather than being reported after the fact.
 
 ### Component foundation
 
@@ -170,6 +219,17 @@ another product's components to build.
 - Peers exchange data through the protocol; they do not read or write each
   other's tables directly.
 
+### Cross-product ownership
+
+- Atlas ERP owns sale recognition, stock truth, and journals. What was sold, at
+  what quantity, and what it is worth in the books are decided here.
+- A connected commerce product owns the order, payment, and fulfilment intent.
+  It submits intent; it does not decide recognition, quantity, or value.
+- Stock arriving from a peer is a proposal or a read, never an authoritative
+  write. A peer's local quantity is a sellable projection, not inventory
+  authority, and stock stays correct with no peer connected.
+- An owner change is a contract amendment, not an implementation detail.
+
 ## Acceptance gates
 
 1. **Standalone business path:** purchasing leads to stock, a manual sale, and a
@@ -192,6 +252,12 @@ another product's components to build.
    required shadcn variable mapping in both light and dark mode with no raw hex
    value in a component, and reads every value it displays from the Python API,
    which stays its only data source.
+
+7. **Legacy transfer:** a capability whose requirement was adopted from legacy
+   knowledge ships only with all of: a public seam naming what it exposes, a
+   stated invariant, a named owning cluster, explicit failure semantics, a real
+   test that runs, and defined UI states for loading, empty, error, and success.
+   An absent, skipped, or stubbed test is not evidence for the gate.
 
 ## Risks and unknowns
 
@@ -217,10 +283,13 @@ another product's components to build.
   sibling product's tree separately, so the same component exists twice and can
   drift. A shadcn upgrade or a local component edit has to be applied
   deliberately per product, and there is no shared package to upgrade once.
-- Nothing checks token parity between the two products. If either shadcn
-  variable mapping is edited and the other is not, the surfaces diverge with
-  no failing check, so parity needs a check that resolves both mappings to the
-  shared token values in both modes.
+- Token parity between the two products is checked by
+  `scripts/check-token-parity.mjs`, which resolves both shadcn variable
+  mappings to the shared token values in both modes and is wired to the
+  `tokens:parity` script, so a mapping edited in one product and not the other
+  fails that check instead of drifting silently. The risk stays open because
+  no automated run invokes the check and it compares the two bridges to each
+  other rather than to the token table above.
 
 ## Amendment history
 
@@ -230,3 +299,4 @@ another product's components to build.
 | 1.1.0 | 2026-09-25 | Approved shared Atlas UI palette and light/dark design-token contract. | ACTIVE |
 | 1.1.1 | 2026-09-25 | Expanded shared UI token table, derived contrast-safe values, and preferred shadcn/ui foundation. | ACTIVE |
 | 1.2.0 | 2026-09-25 | Approved React/Vite/Tailwind/shadcn frontend direction and token mapping for both products. | ACTIVE |
+| 1.3.0 | 2026-09-26 | Approved legacy knowledge transfer rule, evolution map, cross-product ownership, token-parity requirement, and legacy transfer gate. | ACTIVE |

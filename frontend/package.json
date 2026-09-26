@@ -11,7 +11,8 @@
     "typecheck": "tsc -b",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "oxlint --deny-warnings src"
+    "lint": "oxlint --deny-warnings src",
+    "tokens:parity": "node ../scripts/check-token-parity.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",
