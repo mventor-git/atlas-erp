@@ -867,6 +867,24 @@ class Business:
         sale = self.get_sale(sale_id)
         return self.get_journal(sale.journal_id)
 
+    def sale_movements(self, sale_id: str) -> tuple[StockMovement, ...]:
+        """Return the stock movements one sale produced, in recorded order.
+
+        A sale movement is the one whose own reason is ``sale`` and whose
+        reference is the sale, which is what :meth:`create_manual_sale` set.
+        Matching on the reason as well is what keeps a receipt movement out, so
+        an id shared by a receipt and a sale cannot pull the wrong lines in.
+
+        This is a reader over recorded state: an id no sale produced answers an
+        empty tuple rather than an error, the same as :attr:`stock_movements`.
+        """
+
+        return tuple(
+            movement
+            for movement in self._stock_movements.values()
+            if movement.reason == "sale" and movement.reference_id == sale_id
+        )
+
     def _movements_for(
         self,
         prefix: str,

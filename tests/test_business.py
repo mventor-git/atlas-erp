@@ -23,6 +23,7 @@ from atlas_erp import (
     JournalEntry,
     JournalLine,
     MasterItem,
+    Receipt,
     Registry,
     StockLevel,
     UnbalancedJournalEntryError,
@@ -682,6 +683,115 @@ class BusinessRestoreTests(unittest.TestCase):
         target.restore()
         self.assertEqual(target.audit_snapshot().to_dict()["items"], [])
         self.assertEqual(target.audit_snapshot().to_dict()["sales"], [])
+
+    def restore_all(self, source: Business) -> Business:
+        """Rebuild a domain from every record the source holds, purchasing too."""
+
+        records = self.records(source)
+        restored = Business()
+        restored.restore(
+            items=records.items,
+            purchase_orders=source.purchase_orders.values(),
+            receipts=source.receipts.values(),
+            sales=records.sales,
+            journals=records.journals,
+            stock_movements=records.stock_movements,
+        )
+        return restored
+
+    def test_purchasing_survives_a_restore_with_its_receipt(self) -> None:
+        source = self.build()
+        order = next(iter(source.purchase_orders.values()))
+
+        restored = self.restore_all(source)
+
+        self.assertEqual(restored.purchase_orders, source.purchase_orders)
+        self.assertEqual(restored.receipts, source.receipts)
+        # The order is still a received one, so stock cannot be received twice.
+        restored_order = restored.get_purchase_order(order.order_id)
+        self.assertTrue(restored_order.is_received)
+        self.assertEqual(restored_order.receipt_id, order.receipt_id)
+        # _receipts_by_order is derived, so a reload that skipped it would make
+        # this lookup answer None while the receipt itself was there.
+        self.assertEqual(
+            restored.get_receipt_for_order(order.order_id),
+            source.get_receipt_for_order(order.order_id),
+        )
+        with self.assertRaises(DuplicateReceiptError):
+            restored.receive_purchase_order(order.order_id, "receipt-again")
+
+    def test_no_purchasing_reference_dangles_after_a_restore(self) -> None:
+        source = self.build()
+
+        restored = self.restore_all(source)
+
+        movements = [
+            movement
+            for movement in restored.stock_movements.values()
+            if movement.reason == "receipt"
+        ]
+        self.assertTrue(movements, "the fixture must produce receipt movements")
+        for movement in movements:
+            with self.subTest(movement=movement.movement_id):
+                self.assertIn(movement.reference_id, restored.receipts)
+        for receipt in restored.receipts.values():
+            with self.subTest(receipt=receipt.receipt_id):
+                self.assertIn(receipt.order_id, restored.purchase_orders)
+        # The other direction: nothing received and no receipt stored, because a
+        # receipt nothing moved is state the stock does not reflect.
+        self.assertEqual(
+            {receipt.order_id for receipt in restored.receipts.values()},
+            {
+                order.order_id
+                for order in restored.purchase_orders.values()
+                if order.is_received
+            },
+        )
+
+    def test_an_invalid_purchasing_record_is_rejected_at_reload(self) -> None:
+        source = self.build()
+        order = next(iter(source.purchase_orders.values()))
+        receipt = next(iter(source.receipts.values()))
+
+        target = Business()
+        # A store that returned one order twice would silently lose a record.
+        with self.assertRaises(BusinessError):
+            target.restore(purchase_orders=[order, order])
+        # Two receipts for one order is exactly what receive_purchase_order
+        # refuses to create, and collapsing them would leave the index pointing
+        # at whichever arrived last.
+        with self.assertRaises(BusinessError):
+            target.restore(
+                receipts=[
+                    receipt,
+                    Receipt(f"{receipt.receipt_id}-2", order.order_id, receipt.lines),
+                ]
+            )
+        # A rejected reload leaves the target as empty as it was: nothing is
+        # assigned until every record has been built.
+        self.assertEqual(target.purchase_orders, {})
+        self.assertEqual(target.receipts, {})
+
+    def test_sale_movements_answers_only_the_sale_that_produced_them(self) -> None:
+        source = self.build()
+        sale_id = "sale-audit"
+
+        restored = self.restore_all(source)
+
+        # The receipt and the sale share no reason, so matching on reason as
+        # well as reference is what keeps the receipt's movements out.
+        receipt_movements = [
+            movement.movement_id
+            for movement in restored.stock_movements.values()
+            if movement.reason == "receipt"
+        ]
+        self.assertTrue(receipt_movements)
+        sale_movements = [movement.movement_id for movement in restored.sale_movements(sale_id)]
+        self.assertEqual(sale_movements, [f"sale:{sale_id}:0"])
+        self.assertFalse(set(sale_movements) & set(receipt_movements))
+        # A reader over recorded state, not a lookup: an id nothing produced
+        # answers an empty tuple rather than raising.
+        self.assertEqual(restored.sale_movements("sale-never-posted"), ())
 
 
 if __name__ == "__main__":

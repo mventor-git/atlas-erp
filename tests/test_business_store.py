@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from uuid import uuid4
 
 from atlas_erp import (
@@ -34,13 +36,32 @@ OWNED_TABLES = (
     "journal_entries",
     "journal_lines",
     "stock_movements",
+    "purchase_orders",
+    "purchase_order_lines",
+    "receipts",
+    "receipt_lines",
 )
 # A derived value would be a second source of truth, so none may be stored.
 DERIVED_COLUMNS = frozenset(
-    {"stock", "total_cents", "total_debits_cents", "total_credits_cents"}
+    {
+        "stock",
+        "total_cents",
+        "total_debits_cents",
+        "total_credits_cents",
+        # is_received is ``state == "received"``, so a column for it would be a
+        # copy of a comparison that could disagree with the state beside it.
+        "is_received",
+    }
 )
 # Posted in this order, which no id sort reproduces.
 RECORDED_SALE_SUFFIXES = ("later", "audit", "json")
+# The same for purchasing: two received orders, in an order no id sort
+# reproduces, followed by one order left open, which has no receipt.
+RECORDED_PURCHASING_SUFFIXES = ("json", "audit", "open")
+RECORDED_RECEIPT_SUFFIXES = ("json", "audit")
+# The movement reason a receipt produced, which is what a movement's
+# reference_id has to resolve to after a reload.
+RECEIPT_REASON = "receipt"
 
 
 def _database_url() -> str:
@@ -83,12 +104,27 @@ class BusinessStoreRoundTrip:
         second = business.register_item(
             f"{self.prefix}-item-2", f"{self.prefix}-SKU-2", "Second", 500
         )
-        order = business.create_purchase_order(
-            "supplier-1",
-            [(first.item_id, 4), (second.item_id, 6)],
-            order_id=f"{self.prefix}-po-1",
+        # Two received orders, in an order no id sort reproduces, and both with
+        # more than one line so the stored line order is part of the round trip.
+        for suffix, lines in (
+            ("json", [(first.item_id, 4), (second.item_id, 2)]),
+            ("audit", [(first.item_id, 3), (second.item_id, 6)]),
+        ):
+            order = business.create_purchase_order(
+                "supplier-1",
+                lines,
+                order_id=f"{self.prefix}-po-{suffix}",
+            )
+            business.receive_purchase_order(
+                order.order_id, f"{self.prefix}-receipt-{suffix}"
+            )
+        # One order left open, because an unreceived order is the only row whose
+        # receipt_id is NULL and a receipt-less order is still purchasing state.
+        business.create_purchase_order(
+            "supplier-2",
+            [(first.item_id, 1)],
+            order_id=f"{self.prefix}-po-open",
         )
-        business.receive_purchase_order(order.order_id, f"{self.prefix}-receipt-1")
         for suffix, customer, item, price in (
             ("later", "customer-1", first, 1250),
             ("audit", "customer-2", second, 500),
@@ -106,6 +142,8 @@ class BusinessStoreRoundTrip:
         business = Business()
         business.restore(
             items=records.items,
+            purchase_orders=records.purchase_orders,
+            receipts=records.receipts,
             sales=records.sales,
             journals=records.journals,
             stock_movements=records.stock_movements,
@@ -141,7 +179,105 @@ def _assert_a_sale_survives_a_reopen(
     journal = restored.get_journal_for_sale(f"{round_trip.prefix}-sale-audit")
     case.assertEqual(journal.total_cents, 500)
     case.assertEqual(journal.total_debits_cents, journal.total_credits_cents)
-    case.assertEqual(restored.stock_for(f"{round_trip.prefix}-item-2"), 5)
+    # item-2 was received 2 + 6 and sold 1.
+    case.assertEqual(restored.stock_for(f"{round_trip.prefix}-item-2"), 7)
+
+
+def _assert_purchasing_survives_a_reopen(
+    case: unittest.TestCase, round_trip: BusinessStoreRoundTrip
+) -> None:
+    """The order and the receipt are records again, not lost movements."""
+
+    business = round_trip.build_business()
+    store = round_trip.open_store()
+    case.addCleanup(store.close)
+    _seed_business_store(store, business)
+    before = business.audit_snapshot().to_dict()
+    store.close()
+
+    reopened = round_trip.reopen(store)
+    case.addCleanup(reopened.close)
+    records = reopened.load()
+    restored = round_trip.load_business(reopened)
+
+    # Equality of the whole records, so a lost or reordered line fails here.
+    case.assertEqual(records.purchase_orders, tuple(business.purchase_orders.values()))
+    case.assertEqual(records.receipts, tuple(business.receipts.values()))
+    # state and receipt_id are stored, so the order is still a received one.
+    order = restored.get_purchase_order(f"{round_trip.prefix}-po-json")
+    case.assertTrue(order.is_received)
+    case.assertEqual(order.receipt_id, f"{round_trip.prefix}-receipt-json")
+    # An order nobody received comes back open, with no receipt: the NULL
+    # receipt_id round-trips as None rather than as an empty reference.
+    open_order = restored.get_purchase_order(f"{round_trip.prefix}-po-open")
+    case.assertFalse(open_order.is_received)
+    case.assertIsNone(open_order.receipt_id)
+    case.assertIsNone(restored.get_receipt_for_order(f"{round_trip.prefix}-po-open"))
+    # The derived index is rebuilt on reload.  This is the assertion the missing
+    # purchasing tables would have failed: without _receipts_by_order the
+    # lookup answers None even though the receipt itself came back.
+    case.assertEqual(
+        restored.get_receipt_for_order(f"{round_trip.prefix}-po-audit"),
+        business.get_receipt_for_order(f"{round_trip.prefix}-po-audit"),
+    )
+    # The movements a receipt produced came back beside it, and the projection
+    # the audit route serves is byte-identical, cursor included.
+    case.assertEqual(
+        [movement.movement_id for movement in records.stock_movements],
+        list(business.stock_movements),
+    )
+    after = restored.audit_snapshot().to_dict()
+    case.assertEqual(after, before)
+    case.assertEqual(snapshot_cursor(after), snapshot_cursor(before))
+
+
+def _assert_no_reference_dangles_after_a_reopen(
+    case: unittest.TestCase, round_trip: BusinessStoreRoundTrip
+) -> None:
+    """Every stored reference resolves, in both directions.
+
+    A movement that names a receipt which does not exist, or a receipt that
+    names an order which does not, is the incoherence this slice exists to
+    close: ``stock_for`` stays right either way, so only a reference check
+    can see it.
+    """
+
+    business = round_trip.build_business()
+    store = round_trip.open_store()
+    case.addCleanup(store.close)
+    _seed_business_store(store, business)
+    store.close()
+
+    reopened = round_trip.reopen(store)
+    case.addCleanup(reopened.close)
+    restored = round_trip.load_business(reopened)
+
+    receipt_movements = [
+        movement
+        for movement in restored.stock_movements.values()
+        if movement.reason == RECEIPT_REASON
+    ]
+    case.assertTrue(receipt_movements, "the fixture must produce receipt movements")
+    for movement in receipt_movements:
+        with case.subTest(movement=movement.movement_id):
+            case.assertIn(movement.reference_id, restored.receipts)
+    for receipt in restored.receipts.values():
+        with case.subTest(receipt=receipt.receipt_id):
+            case.assertIn(receipt.order_id, restored.purchase_orders)
+    # The other direction: a receipt nothing moved, or an order marked received
+    # with no receipt, is purchasing state the stock does not reflect.
+    case.assertEqual(
+        {movement.reference_id for movement in receipt_movements},
+        set(restored.receipts),
+    )
+    case.assertEqual(
+        {receipt.order_id for receipt in restored.receipts.values()},
+        {
+            order.order_id
+            for order in restored.purchase_orders.values()
+            if order.is_received
+        },
+    )
 
 
 def _assert_recorded_order_is_returned(
@@ -154,6 +290,20 @@ def _assert_recorded_order_is_returned(
 
     records = store.load()
 
+    case.assertEqual(
+        [order.order_id for order in records.purchase_orders],
+        [
+            f"{round_trip.prefix}-po-{suffix}"
+            for suffix in RECORDED_PURCHASING_SUFFIXES
+        ],
+    )
+    case.assertEqual(
+        [receipt.receipt_id for receipt in records.receipts],
+        [
+            f"{round_trip.prefix}-receipt-{suffix}"
+            for suffix in RECORDED_RECEIPT_SUFFIXES
+        ],
+    )
     case.assertEqual(
         [sale.sale_id for sale in records.sales],
         [f"{round_trip.prefix}-sale-{suffix}" for suffix in RECORDED_SALE_SUFFIXES],
@@ -182,6 +332,12 @@ class InMemoryBusinessStoreTests(BusinessStoreRoundTrip, unittest.TestCase):
     def test_a_sale_written_through_the_store_reloads_byte_identically(self) -> None:
         _assert_a_sale_survives_a_reopen(self, self)
 
+    def test_purchasing_survives_a_reopen(self) -> None:
+        _assert_purchasing_survives_a_reopen(self, self)
+
+    def test_no_reference_dangles_after_a_reopen(self) -> None:
+        _assert_no_reference_dangles_after_a_reopen(self, self)
+
     def test_recorded_order_is_returned_rather_than_id_order(self) -> None:
         _assert_recorded_order_is_returned(self, self)
 
@@ -198,9 +354,23 @@ class InMemoryBusinessStoreTests(BusinessStoreRoundTrip, unittest.TestCase):
         records = store.load()
 
         self.assertEqual(records.items, ())
+        self.assertEqual(records.purchase_orders, ())
+        self.assertEqual(records.receipts, ())
         self.assertEqual(records.sales, ())
         self.assertEqual(records.journals, ())
         self.assertEqual(records.stock_movements, ())
+
+    def test_the_seed_writes_everything_through_one_transaction(self) -> None:
+        # The in-memory transaction cannot roll anything back, so what is
+        # pinned here is only that the seed opens one at all: the next boot
+        # trusts whatever is there, so the writes must be a single unit.
+        store = _TransactionCountingStore()
+
+        _seed_business_store(store, self.build_business())
+
+        self.assertEqual(store.transactions, 1)
+        self.assertEqual(len(store.load().purchase_orders), 3)
+        self.assertEqual(len(store.load().receipts), 2)
 
     def test_ensure_schema_and_close_may_be_called_more_than_once(self) -> None:
         store = self.open_store()
@@ -209,6 +379,27 @@ class InMemoryBusinessStoreTests(BusinessStoreRoundTrip, unittest.TestCase):
         store.ensure_schema()
         store.close()
         store.close()
+
+
+class _TransactionCountingStore(InMemoryBusinessStore):
+    """An in-memory store that counts the transaction blocks the seed opens."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.transactions = 0
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        self.transactions += 1
+        with super().transaction():
+            yield None
+
+
+class _RefusingReceiptStore(PostgresBusinessStore):
+    """A durable store whose receipt write fails, to pin the seed's boundary."""
+
+    def save_receipt(self, receipt: object) -> None:
+        raise RuntimeError("the receipt write was refused")
 
 
 @unittest.skipUnless(_database_url(), f"set {DATABASE_ENV} to run")
@@ -241,10 +432,25 @@ class PostgresBusinessStoreTests(BusinessStoreRoundTrip, unittest.TestCase):
             )
             connection.execute(
                 "DELETE FROM stock_movements WHERE reference_id LIKE %s",
-                (f"{self.prefix}%",),
+                (f"{self.prefix}%",)
             )
             connection.execute(
                 "DELETE FROM master_items WHERE item_id LIKE %s", (f"{self.prefix}%",)
+            )
+            connection.execute(
+                "DELETE FROM purchase_order_lines WHERE order_id LIKE %s",
+                (f"{self.prefix}%",),
+            )
+            connection.execute(
+                "DELETE FROM receipt_lines WHERE receipt_id LIKE %s",
+                (f"{self.prefix}%",),
+            )
+            connection.execute(
+                "DELETE FROM receipts WHERE receipt_id LIKE %s", (f"{self.prefix}%",)
+            )
+            connection.execute(
+                "DELETE FROM purchase_orders WHERE order_id LIKE %s",
+                (f"{self.prefix}%",),
             )
 
     def open_store(self) -> BusinessStore:
@@ -256,6 +462,30 @@ class PostgresBusinessStoreTests(BusinessStoreRoundTrip, unittest.TestCase):
         # A second PostgresBusinessStore is a real restart here: the first
         # instance is closed and its connection dropped before this one exists.
         _assert_a_sale_survives_a_reopen(self, self)
+
+    def test_purchasing_survives_a_reopen(self) -> None:
+        # A purchase order and its receipt come back after the store is closed
+        # and reopened, the movements still match, and the projection the audit
+        # route serves is byte-identical right down to the cursor.
+        _assert_purchasing_survives_a_reopen(self, self)
+
+    def test_no_reference_dangles_after_a_reopen(self) -> None:
+        _assert_no_reference_dangles_after_a_reopen(self, self)
+
+    def test_a_refused_write_rolls_the_whole_seed_back(self) -> None:
+        # The seed is one unit of work because the next boot restores whatever
+        # is there as truth: a partial store would be a lie, not a slow start.
+        store = self.open_store()
+        refusing = _RefusingReceiptStore(_database_url())
+        self.addCleanup(refusing.close)
+
+        with self.assertRaises(RuntimeError):
+            _seed_business_store(refusing, self.build_business())
+
+        self.assertEqual(store.load().items, ())
+        self.assertEqual(store.load().purchase_orders, ())
+        self.assertEqual(store.load().receipts, ())
+        self.assertEqual(store.load().stock_movements, ())
 
     def test_recorded_order_is_returned_rather_than_id_order(self) -> None:
         _assert_recorded_order_is_returned(self, self)

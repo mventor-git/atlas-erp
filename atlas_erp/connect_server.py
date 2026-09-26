@@ -9,8 +9,9 @@ A connected sale can be made idempotent by ``sale_id`` by injecting a
 :class:`~atlas_erp.sale_store.SaleCommandStore`.  That store holds the receipt
 of the sale command only; the business state behind it stays in memory unless a
 :class:`~atlas_erp.business_store.BusinessStore` is injected too, in which case
-the item master, sales, journals, and stock movements are written through and
-reloaded on the next start.
+the item master, the purchasing a receipt's movements came from, sales,
+journals, and stock movements are written through and reloaded on the next
+start.
 """
 
 from __future__ import annotations
@@ -33,7 +34,6 @@ from .business import (
     BusinessError,
     DuplicateSaleError,
     InsufficientStockError,
-    StockMovement,
 )
 from .business_store import BusinessStore, PostgresBusinessStore
 from .protocol import ProtocolKernel
@@ -383,7 +383,7 @@ class ConnectHandler(BaseHTTPRequestHandler):
         business = self.server.business
         sale = business.get_sale(sale_id)
         store.save_sale(sale, business.get_journal_for_sale(sale_id))
-        store.save_movements(_sale_movements(business, sale_id))
+        store.save_movements(business.sale_movements(sale_id))
 
     def _create_manual_sale(
         self, request: tuple[str, str, list[dict[str, object]]]
@@ -592,22 +592,6 @@ class ConnectHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if getattr(self, "command", None) != "HEAD":
             self.wfile.write(body)
-
-
-def _sale_movements(business: Business, sale_id: str) -> list[StockMovement]:
-    """Return the stock movements one sale produced, in recorded order.
-
-    A sale movement is the one whose own reason is ``sale`` and whose
-    reference is the sale, which is what the domain set when it posted the
-    sale.  A receipt movement is excluded by the reason, so an id shared by a
-    receipt and a sale cannot pull the wrong lines in.
-    """
-
-    return [
-        movement
-        for movement in business.stock_movements.values()
-        if movement.reason == "sale" and movement.reference_id == sale_id
-    ]
 
 
 def _make_server(
@@ -849,23 +833,31 @@ def _business_store() -> BusinessStore | None:
 
 
 def _seed_business_store(store: BusinessStore, business: Business) -> None:
-    """Write the smoke fixture into an empty store, once.
+    """Write the smoke fixture into an empty store, once, as one unit of work.
 
     Without this the store would never hold an item, and a restart would restore
-    a domain with no master to sell from.  The fixture's purchase order and
-    receipt have no table yet, but its movements do, so the stock a reload
-    derives is the stock that was there.
+    a domain with no master to sell from.  The records are written in the order
+    the domain created them, purchasing included, so the movements a receipt
+    produced are stored beside the receipt that produced them.
 
-    ponytail: one transaction per call, so a seed interrupted half way leaves a
-    partial store that a later boot restores as truth.  Seed the purchasing
-    tables with the rest of the schema when they arrive.
+    The whole seed is one transaction because the next boot trusts whatever is
+    there: a seed interrupted half way would otherwise leave a partial store that
+    the next boot restores as truth.  ponytail: a connected sale is still written
+    outside any such block, so a crash can leave business state ahead of a
+    ``pending`` receipt; merging the two stores into one transaction is a later
+    slice.
     """
 
-    for item in business.items.values():
-        store.save_item(item)
-    for sale in business.sales.values():
-        store.save_sale(sale, business.get_journal_for_sale(sale.sale_id))
-    store.save_movements(business.stock_movements.values())
+    with store.transaction():
+        for item in business.items.values():
+            store.save_item(item)
+        for order in business.purchase_orders.values():
+            store.save_purchase_order(order)
+        for receipt in business.receipts.values():
+            store.save_receipt(receipt)
+        for sale in business.sales.values():
+            store.save_sale(sale, business.get_journal_for_sale(sale.sale_id))
+        store.save_movements(business.stock_movements.values())
 
 
 def _startup_business(
@@ -889,6 +881,8 @@ def _startup_business(
     business = Business()
     business.restore(
         items=records.items,
+        purchase_orders=records.purchase_orders,
+        receipts=records.receipts,
         sales=records.sales,
         journals=records.journals,
         stock_movements=records.stock_movements,
