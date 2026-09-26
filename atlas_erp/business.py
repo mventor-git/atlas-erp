@@ -550,6 +550,19 @@ def _journal_line(value: object) -> JournalLine:
     )
 
 
+def _restored[_T](target: dict[str, _T], key: str, record: _T) -> None:
+    """Insert one rehydrated record, refusing to collapse a duplicate key.
+
+    A store that returned the same ``item_id`` or ``sku`` twice would otherwise
+    silently lose a record, which is the failure mode a rehydration path is
+    most able to hide.
+    """
+
+    if key in target:
+        raise BusinessError(f"duplicate record in restored state: {key}")
+    target[key] = record
+
+
 class Business:
     """A small in-memory purchasing, stock, sales, and finance domain object.
 
@@ -569,6 +582,114 @@ class Business:
         self._sales: dict[str, Sale] = {}
         self._journals: dict[str, JournalEntry] = {}
         self._stock_movements: dict[str, StockMovement] = {}
+
+    def restore(
+        self,
+        *,
+        items: Iterable[MasterItem] = (),
+        purchase_orders: Iterable[PurchaseOrder] = (),
+        receipts: Iterable[Receipt] = (),
+        sales: Iterable[Sale] = (),
+        journals: Iterable[JournalEntry] = (),
+        stock_movements: Iterable[StockMovement] = (),
+    ) -> None:
+        """Repopulate local state from stored records, replacing what is there.
+
+        This is the one way the domain is rebuilt from its own records, so the
+        order it is given *is* the order :meth:`audit_snapshot` reports: the
+        domain has no clock and no sequence, and none is invented here.  Every
+        record is rebuilt through its own constructor, so an invalid one fails
+        loudly during reload instead of producing a wrong number later, and
+        nothing is assigned until every record has been built, so a rejected
+        reload leaves the previous state intact.
+
+        The two derived indexes are rebuilt rather than trusted: ``sku``
+        uniqueness (``_items_by_sku``) and the order-to-receipt lookup
+        (``_receipts_by_order``) have no invariant of their own, and skipping
+        them would silently lose both.  The latter is derived from the
+        receipts' own ``order_id``, so it needs no purchase order to exist.
+        """
+
+        restored_items: dict[str, MasterItem] = {}
+        items_by_sku: dict[str, MasterItem] = {}
+        for record in items:
+            item = MasterItem(
+                record.item_id, record.sku, record.name, record.price_cents
+            )
+            _restored(restored_items, item.item_id, item)
+            _restored(items_by_sku, item.sku, item)
+
+        restored_orders: dict[str, PurchaseOrder] = {}
+        for record in purchase_orders:
+            _restored(
+                restored_orders,
+                record.order_id,
+                PurchaseOrder(
+                    record.order_id,
+                    record.supplier_id,
+                    record.lines,
+                    record.state,
+                    record.receipt_id,
+                ),
+            )
+
+        restored_receipts: dict[str, Receipt] = {}
+        receipts_by_order: dict[str, str] = {}
+        for record in receipts:
+            receipt = Receipt(
+                record.receipt_id, record.order_id, record.lines, record.state
+            )
+            _restored(restored_receipts, receipt.receipt_id, receipt)
+            _restored(receipts_by_order, receipt.order_id, receipt.receipt_id)
+
+        restored_sales: dict[str, Sale] = {}
+        for record in sales:
+            _restored(
+                restored_sales,
+                record.sale_id,
+                Sale(
+                    record.sale_id,
+                    record.customer_id,
+                    record.lines,
+                    record.journal_id,
+                ),
+            )
+
+        restored_journals: dict[str, JournalEntry] = {}
+        for record in journals:
+            _restored(
+                restored_journals,
+                record.journal_id,
+                JournalEntry(
+                    record.journal_id,
+                    record.sale_id,
+                    record.lines,
+                    record.state,
+                ),
+            )
+
+        restored_movements: dict[str, StockMovement] = {}
+        for record in stock_movements:
+            _restored(
+                restored_movements,
+                record.movement_id,
+                StockMovement(
+                    record.movement_id,
+                    record.item_id,
+                    record.quantity_delta,
+                    record.reason,
+                    record.reference_id,
+                ),
+            )
+
+        self._items = restored_items
+        self._items_by_sku = items_by_sku
+        self._orders = restored_orders
+        self._receipts = restored_receipts
+        self._receipts_by_order = receipts_by_order
+        self._sales = restored_sales
+        self._journals = restored_journals
+        self._stock_movements = restored_movements
 
     def register_item(
         self,

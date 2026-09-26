@@ -9,6 +9,8 @@ from atlas_erp import (
     CASH_ACCOUNT_CODE,
     REVENUE_ACCOUNT_CODE,
     Business,
+    BusinessError,
+    BusinessRecords,
     DuplicateItemError,
     DuplicateReceiptError,
     DuplicateSaleError,
@@ -533,6 +535,153 @@ class AuditSnapshotTests(unittest.TestCase):
                 "stock_movements": [],
             },
         )
+
+
+class BusinessRestoreTests(unittest.TestCase):
+    """Rehydration from records, which is what makes the domain durable."""
+
+    def build(self) -> Business:
+        business = Business()
+        first = business.register_item("item-1", "SKU-1", "First", 1250)
+        second = business.register_item("item-2", "SKU-2", "Second", 500)
+        order = business.create_purchase_order(
+            "supplier-1",
+            [(first.item_id, 2), (second.item_id, 3)],
+            order_id="po-restore-1",
+        )
+        business.receive_purchase_order(order.order_id, "receipt-restore-1")
+        # The ids are deliberately not alphabetical, because the snapshot
+        # reports these three in recorded order and not sorted order.
+        business.create_manual_sale(
+            "customer-1",
+            [{"item_id": first.item_id, "quantity": 1, "unit_price_cents": 1250}],
+            sale_id="sale-audit",
+        )
+        business.create_manual_sale(
+            "customer-2",
+            [{"item_id": second.item_id, "quantity": 1, "unit_price_cents": 500}],
+            sale_id="sale-json",
+        )
+        business.create_manual_sale(
+            "customer-3",
+            [{"item_id": first.item_id, "quantity": 1, "unit_price_cents": 1250}],
+            sale_id="sale-later",
+        )
+        return business
+
+    def records(self, business: Business) -> BusinessRecords:
+        return BusinessRecords(
+            items=tuple(business.items.values()),
+            sales=tuple(business.sales.values()),
+            journals=tuple(business.journals.values()),
+            stock_movements=tuple(business.stock_movements.values()),
+        )
+
+    def test_a_restored_domain_reports_an_identical_snapshot(self) -> None:
+        source = self.build()
+        expected = source.audit_snapshot().to_dict()
+
+        restored = Business()
+        records = self.records(source)
+        restored.restore(
+            items=records.items,
+            sales=records.sales,
+            journals=records.journals,
+            stock_movements=records.stock_movements,
+        )
+
+        self.assertEqual(restored.audit_snapshot().to_dict(), expected)
+        self.assertEqual(restored.stock, source.stock)
+
+    def test_recorded_order_survives_where_the_snapshot_reports_it(self) -> None:
+        source = self.build()
+        restored = Business()
+        records = self.records(source)
+        restored.restore(
+            items=records.items,
+            sales=records.sales,
+            journals=records.journals,
+            stock_movements=records.stock_movements,
+        )
+
+        snapshot = restored.audit_snapshot()
+        self.assertEqual(
+            [sale.sale_id for sale in snapshot.sales],
+            ["sale-audit", "sale-json", "sale-later"],
+        )
+        self.assertEqual(
+            [journal.journal_id for journal in snapshot.journals],
+            ["journal-sale-audit", "journal-sale-json", "journal-sale-later"],
+        )
+        self.assertEqual(
+            [movement.movement_id for movement in snapshot.stock_movements],
+            list(source.stock_movements),
+        )
+
+    def test_the_two_derived_indexes_are_rebuilt(self) -> None:
+        source = self.build()
+        restored = Business()
+        order = next(iter(source.purchase_orders.values()))
+        restored.restore(
+            items=self.records(source).items,
+            purchase_orders=source.purchase_orders.values(),
+            receipts=source.receipts.values(),
+            sales=self.records(source).sales,
+            journals=self.records(source).journals,
+            stock_movements=self.records(source).stock_movements,
+        )
+
+        # Skipping _items_by_sku would lose SKU uniqueness.
+        with self.assertRaises(DuplicateItemError):
+            restored.register_item("item-3", "SKU-2", "Clash")
+        # Skipping _receipts_by_order would make the lookup answer None.
+        self.assertEqual(
+            restored.get_receipt_for_order(order.order_id),
+            source.get_receipt_for_order(order.order_id),
+        )
+        self.assertEqual(restored.get_purchase_order(order.order_id), order)
+
+    def test_an_invalid_record_is_rejected_at_reload_and_changes_nothing(self) -> None:
+        source = self.build()
+        expected = source.audit_snapshot().to_dict()
+        corrupt = MasterItem("item-9", "SKU-9", "Corrupt", 100)
+        # Only object.__setattr__ can produce a record that skipped its own
+        # __post_init__, which is exactly what a corrupt stored row would be.
+        object.__setattr__(corrupt, "price_cents", -1)
+
+        target = Business()
+        with self.assertRaises(InvalidPriceError):
+            target.restore(items=[corrupt], sales=source.sales.values())
+
+        self.assertEqual(target.audit_snapshot().to_dict()["items"], [])
+        self.assertEqual(source.audit_snapshot().to_dict(), expected)
+
+    def test_a_duplicate_key_is_refused_rather_than_silently_collapsed(self) -> None:
+        source = self.build()
+        items = list(source.items.values())
+
+        target = Business()
+        with self.assertRaises(BusinessError):
+            target.restore(items=[items[0], items[0]])
+        with self.assertRaises(BusinessError):
+            target.restore(sales=[*source.sales.values(), source.get_sale("sale-json")])
+
+    def test_restoring_replaces_whatever_was_there(self) -> None:
+        source = self.build()
+        records = self.records(source)
+
+        target = self.build()
+        target.restore(
+            items=records.items,
+            sales=records.sales,
+            journals=records.journals,
+            stock_movements=records.stock_movements,
+        )
+        self.assertEqual(target.audit_snapshot().to_dict(), source.audit_snapshot().to_dict())
+
+        target.restore()
+        self.assertEqual(target.audit_snapshot().to_dict()["items"], [])
+        self.assertEqual(target.audit_snapshot().to_dict()["sales"], [])
 
 
 if __name__ == "__main__":

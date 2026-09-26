@@ -9,7 +9,9 @@ from unittest import mock
 from atlas_erp import (
     RESERVED,
     Business,
+    BusinessStore,
     ConnectServer,
+    InMemoryBusinessStore,
     InMemorySaleCommandStore,
     ProtocolKernel,
     SaleCommandStore,
@@ -22,6 +24,7 @@ from atlas_erp.connect_server import (
     MAX_BODY_BYTES,
     ConnectHandler,
     _RequestError,
+    _seed_business_store,
 )
 
 
@@ -30,6 +33,13 @@ _RAW = object()
 # The rejected-request race is rare, so the wire test repeats it; the drain
 # itself is pinned directly by RejectedRequestBodyTests.
 REPEATED_REJECTIONS = 25
+
+
+class _RefusingBusinessStore(InMemoryBusinessStore):
+    """A business store whose durable write fails, to pin the write ordering."""
+
+    def save_sale(self, sale: object, journal: object) -> None:
+        raise RuntimeError("the durable write was refused")
 
 
 class ConnectHandlerTests(unittest.TestCase):
@@ -100,7 +110,11 @@ class ConnectHandlerTests(unittest.TestCase):
             server=server,
         )
 
-    def store_server(self, store: SaleCommandStore) -> ConnectServer:
+    def store_server(
+        self,
+        store: SaleCommandStore,
+        business_store: BusinessStore | None = None,
+    ) -> ConnectServer:
         """Start a second server over the same domain, sharing one sale store."""
 
         server = ConnectServer(
@@ -109,6 +123,7 @@ class ConnectHandlerTests(unittest.TestCase):
             "test-token",
             port=0,
             sale_store=store,
+            business_store=business_store,
         )
         server.start()
         self.addCleanup(server.close)
@@ -521,6 +536,64 @@ class ConnectHandlerTests(unittest.TestCase):
         self.assertEqual(later_status, 201)
         self.assertEqual(later["sale_id"], "sale-http-no-stock")
         self.assertEqual(self.business.stock, {"item-1": 0})
+
+    def test_a_connected_sale_is_written_through_so_a_restart_still_knows_it(
+        self,
+    ) -> None:
+        business_store = InMemoryBusinessStore()
+        store = InMemorySaleCommandStore()
+        server = self.store_server(store, business_store)
+        # The boot sequence seeds an empty store from the domain it is about to
+        # serve, so the item master is already durable before the first sale.
+        _seed_business_store(business_store, self.business)
+
+        status, _, payload = self.post_sale(self.sale_body(), server=server)
+
+        self.assertEqual(status, 201)
+        # The domain has moved on, so the snapshot a restarted process would
+        # serve has to move with it: otherwise a replayed receipt names a sale
+        # the audit route no longer lists and stock no longer reflects.
+        expected = self.business.audit_snapshot().to_dict()
+
+        restored = Business()
+        records = business_store.load()
+        restored.restore(
+            items=records.items,
+            sales=records.sales,
+            journals=records.journals,
+            stock_movements=records.stock_movements,
+        )
+
+        after = restored.audit_snapshot().to_dict()
+        self.assertEqual(after, expected)
+        self.assertEqual(snapshot_cursor(after), snapshot_cursor(expected))
+        self.assertEqual(
+            [cast(dict[str, object], sale)["sale_id"] for sale in cast(list[object], after["sales"])],
+            ["sale-http-1", payload["sale_id"]],
+        )
+        self.assertEqual(after["stock"], [{"item_id": "item-1", "quantity": 0}])
+
+    def test_a_failed_durable_write_releases_the_key_and_never_answers_201(
+        self,
+    ) -> None:
+        store = InMemorySaleCommandStore()
+        server = self.store_server(store, _RefusingBusinessStore())
+        body = self.sale_body(sale_id="sale-http-refused")
+
+        status, _, payload = self.post_sale(body, server=server)
+
+        self.assertEqual(status, 500)
+        self.assertEqual(payload, {"error": "internal server error"})
+        # No receipt was completed, so nothing replays as a 201, and the
+        # reservation was released rather than burned.
+        lines = cast(list[dict[str, object]], body["lines"])
+        self.assertEqual(
+            store.reserve(
+                "sale-http-refused",
+                sale_command_hash(("customer-http-2", "sale-http-refused", lines)),
+            ).outcome,
+            RESERVED,
+        )
 
     def test_a_rejected_content_type_lets_the_client_read_the_response(self) -> None:
         # Answering before the request body is read makes Windows reset the

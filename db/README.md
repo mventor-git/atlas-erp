@@ -212,7 +212,11 @@ ORDER BY po.po_number;
 ## Not in scope
 
 No `atlas_erp` production schema, no migration tool, no Docker or dependency
-changes, and no code that reads these tables. The only table the application
-itself owns today is `connected_sale_commands`, created by
-`atlas_erp.sale_store`. Wiring the real ERP state store to `db/` is a later
+changes, and no code that reads these tables. The application owns two stores
+of its own, neither of them these example tables and neither wired to `db/`:
+`connected_sale_commands`, created by `atlas_erp.sale_store`, and the six
+tables behind `atlas_erp.business_store` (the item master, sales, journal
+entries and their lines, and stock movements) created by
+`atlas_erp.business_store`. Both use `CREATE TABLE IF NOT EXISTS`; neither is a
+migration system. Pointing the ERP business state at `db/` is a later
 decision, not part of this dataset.

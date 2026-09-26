@@ -49,6 +49,12 @@ from .business import (
     UnknownSaleError,
     register_business_capabilities,
 )
+from .business_store import (
+    BusinessRecords,
+    BusinessStore,
+    InMemoryBusinessStore,
+    PostgresBusinessStore,
+)
 from .protocol import (
     CONNECT_VERSION,
     AuthorityConflictError,
@@ -95,6 +101,8 @@ __all__ = [
     "BASELINE_CLUSTERS",
     "Business",
     "BusinessError",
+    "BusinessRecords",
+    "BusinessStore",
     "CASH_ACCOUNT",
     "CASH_ACCOUNT_CODE",
     "CONNECT_VERSION",
@@ -111,6 +119,7 @@ __all__ = [
     "DuplicateRegistrationError",
     "DuplicateSaleError",
     "IncompatibleVersionError",
+    "InMemoryBusinessStore",
     "InMemorySaleCommandStore",
     "IN_PROGRESS",
     "InvalidCursorError",
@@ -126,6 +135,7 @@ __all__ = [
     "MasterItem",
     "PAYLOAD_CONFLICT",
     "PermissionDeniedError",
+    "PostgresBusinessStore",
     "PostgresSaleCommandStore",
     "Proposal",
     "ProposalError",

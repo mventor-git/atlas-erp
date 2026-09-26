@@ -7,7 +7,10 @@ loopback address, and every connect route also refuses a non-loopback peer.
 
 A connected sale can be made idempotent by ``sale_id`` by injecting a
 :class:`~atlas_erp.sale_store.SaleCommandStore`.  That store holds the receipt
-of the sale command only; the business state behind it stays in memory.
+of the sale command only; the business state behind it stays in memory unless a
+:class:`~atlas_erp.business_store.BusinessStore` is injected too, in which case
+the item master, sales, journals, and stock movements are written through and
+reloaded on the next start.
 """
 
 from __future__ import annotations
@@ -30,7 +33,9 @@ from .business import (
     BusinessError,
     DuplicateSaleError,
     InsufficientStockError,
+    StockMovement,
 )
+from .business_store import BusinessStore, PostgresBusinessStore
 from .protocol import ProtocolKernel
 from .sale_store import (
     IN_PROGRESS,
@@ -219,11 +224,13 @@ class _ConnectHTTPServer(HTTPServer):
         protocol: ProtocolKernel,
         token: str,
         sale_store: SaleCommandStore | None,
+        business_store: BusinessStore | None,
     ) -> None:
         self.business = business
         self.protocol = protocol
         self.token = token
         self.sale_store = sale_store
+        self.business_store = business_store
         super().__init__(server_address, handler)
 
 
@@ -240,6 +247,12 @@ class ConnectHandler(BaseHTTPRequestHandler):
     domain again, and a different request for the same ``sale_id`` is a
     conflict.  Without one, a retry of an already accepted ``sale_id`` gets
     ``409 duplicate sale`` from the in-memory domain.
+
+    When a business store is injected as well, a posted sale is written through
+    *before* its receipt is completed, so a store that cannot record the sale
+    leaves the receipt uncompleted and the peer gets no ``201``.  That is the
+    same direction the abort below already takes: a receipt a peer may replay
+    is only written once the business facts behind it are durable.
 
     The result carries the posted sale record in the same typed shape as the
     audit snapshot, so a peer can validate what it was handed without a second
@@ -344,12 +357,33 @@ class ConnectHandler(BaseHTTPRequestHandler):
             raise _RequestError(409, "sale in progress")
         try:
             payload = self._create_manual_sale(request)
+            # The durable write comes before the receipt on purpose: a store
+            # that cannot record the sale aborts the key below, so the peer is
+            # never handed a 201 for a sale no restart would still know about.
+            self._write_business_state(sale_id)
         except BaseException:
             # A rejected command must not burn the idempotency key.
             store.abort(sale_id)
             raise
         store.complete(sale_id, payload)
         return payload
+
+    def _write_business_state(self, sale_id: str) -> None:
+        """Write one posted sale, its journal, and its movements through.
+
+        A no-op without a business store, where the in-memory domain is the
+        only state there is.  The movements are read back off the domain rather
+        than rebuilt, so the durable movement ids are the ones the domain
+        itself minted.
+        """
+
+        store = self.server.business_store
+        if store is None:
+            return
+        business = self.server.business
+        sale = business.get_sale(sale_id)
+        store.save_sale(sale, business.get_journal_for_sale(sale_id))
+        store.save_movements(_sale_movements(business, sale_id))
 
     def _create_manual_sale(
         self, request: tuple[str, str, list[dict[str, object]]]
@@ -560,6 +594,22 @@ class ConnectHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
 
+def _sale_movements(business: Business, sale_id: str) -> list[StockMovement]:
+    """Return the stock movements one sale produced, in recorded order.
+
+    A sale movement is the one whose own reason is ``sale`` and whose
+    reference is the sale, which is what the domain set when it posted the
+    sale.  A receipt movement is excluded by the reason, so an id shared by a
+    receipt and a sale cannot pull the wrong lines in.
+    """
+
+    return [
+        movement
+        for movement in business.stock_movements.values()
+        if movement.reason == "sale" and movement.reference_id == sale_id
+    ]
+
+
 def _make_server(
     host: str,
     port: int,
@@ -567,6 +617,7 @@ def _make_server(
     protocol: ProtocolKernel,
     token: str,
     sale_store: SaleCommandStore | None,
+    business_store: BusinessStore | None,
 ) -> _ConnectHTTPServer:
     if ":" in host:
         class _IPv6ConnectHTTPServer(_ConnectHTTPServer):
@@ -576,7 +627,13 @@ def _make_server(
     else:
         server_type = _ConnectHTTPServer
     return server_type(
-        (host, port), ConnectHandler, business, protocol, token, sale_store
+        (host, port),
+        ConnectHandler,
+        business,
+        protocol,
+        token,
+        sale_store,
+        business_store,
     )
 
 
@@ -587,6 +644,10 @@ class ConnectServer:
     idempotent by ``sale_id`` for the lifetime of that store; leaving it out
     keeps the in-memory behaviour where a repeated ``sale_id`` is rejected by
     the domain itself.
+
+    ``business_store`` is optional too.  Injecting one makes the state a posted
+    sale produces durable, so the receipt a peer can replay and the sale that
+    receipt names both survive a restart.
     """
 
     def __init__(
@@ -597,12 +658,14 @@ class ConnectServer:
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         sale_store: SaleCommandStore | None = None,
+        business_store: BusinessStore | None = None,
     ) -> None:
         if not isinstance(token, str) or not token.strip():
             raise ValueError("connect token must not be empty")
         self.business = business
         self.protocol = protocol
         self.sale_store = sale_store
+        self.business_store = business_store
         self._host = _normalise_host(host)
         self._port = _normalise_port(port)
         self._server = _make_server(
@@ -612,6 +675,7 @@ class ConnectServer:
             protocol,
             token,
             sale_store,
+            business_store,
         )
         self._thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
@@ -691,6 +755,8 @@ class ConnectServer:
             self._close_socket()
         if self.sale_store is not None:
             self.sale_store.close()
+        if self.business_store is not None:
+            self.business_store.close()
 
     def wait(self, timeout: float | None = None) -> None:
         """Wait for a server started with :meth:`start` to finish."""
@@ -764,6 +830,72 @@ def _database_store() -> SaleCommandStore | None:
         raise ValueError(f"{DATABASE_ENV} could not be used") from exc
 
 
+def _business_store() -> BusinessStore | None:
+    """Return the durable business store, on exactly the sale store's terms.
+
+    Same variable, same blank-means-in-memory rule, and the same refusal to
+    report anything but the variable name when a configured database cannot be
+    used.  Two stores over one URL is deliberate: they own different tables and
+    merging them into one transaction is a later slice.
+    """
+
+    dsn = os.environ.get(DATABASE_ENV, "")
+    if not dsn.strip():
+        return None
+    try:
+        return PostgresBusinessStore(dsn)
+    except Exception as exc:
+        raise ValueError(f"{DATABASE_ENV} could not be used") from exc
+
+
+def _seed_business_store(store: BusinessStore, business: Business) -> None:
+    """Write the smoke fixture into an empty store, once.
+
+    Without this the store would never hold an item, and a restart would restore
+    a domain with no master to sell from.  The fixture's purchase order and
+    receipt have no table yet, but its movements do, so the stock a reload
+    derives is the stock that was there.
+
+    ponytail: one transaction per call, so a seed interrupted half way leaves a
+    partial store that a later boot restores as truth.  Seed the purchasing
+    tables with the rest of the schema when they arrive.
+    """
+
+    for item in business.items.values():
+        store.save_item(item)
+    for sale in business.sales.values():
+        store.save_sale(sale, business.get_journal_for_sale(sale.sale_id))
+    store.save_movements(business.stock_movements.values())
+
+
+def _startup_business(
+    store: BusinessStore | None,
+) -> tuple[Business, ProtocolKernel]:
+    """Return the domain this process serves and the kernel over it.
+
+    With no business store this is the in-memory smoke fixture, unchanged.  With
+    one, stored state wins: an empty store is seeded from the fixture once, and
+    a populated store is restored instead of the fixture, which is what makes a
+    restart serve the sales it already acknowledged instead of forgetting them.
+    """
+
+    if store is None:
+        return _fixture()
+    records = store.load()
+    if not records.items:
+        business, protocol = _fixture()
+        _seed_business_store(store, business)
+        return business, protocol
+    business = Business()
+    business.restore(
+        items=records.items,
+        sales=records.sales,
+        journals=records.journals,
+        stock_movements=records.stock_movements,
+    )
+    return business, ProtocolKernel(business.registry)
+
+
 def main() -> int:
     token = os.environ.get(TOKEN_ENV)
     if token is None or not token.strip():
@@ -773,8 +905,9 @@ def main() -> int:
     try:
         host = os.environ.get(HOST_ENV, DEFAULT_HOST)
         port = _environment_port()
-        business, protocol = _fixture()
         store = _database_store()
+        business_store = _business_store()
+        business, protocol = _startup_business(business_store)
         server = ConnectServer(
             business,
             protocol,
@@ -782,14 +915,17 @@ def main() -> int:
             host=host,
             port=port,
             sale_store=store,
+            business_store=business_store,
         )
     except (OSError, ValueError) as exc:
         print(f"could not start Atlas ERP Connect: {exc}", file=sys.stderr)
         return 2
 
     mode = "postgres" if store is not None else "in-memory"
+    state = "postgres" if business_store is not None else "in-memory"
     print(
-        f"Atlas ERP Connect listening on {server.url} (sale receipts: {mode})",
+        f"Atlas ERP Connect listening on {server.url} "
+        f"(sale receipts: {mode}, business state: {state})",
         flush=True,
     )
     try:
