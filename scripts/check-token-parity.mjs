@@ -20,11 +20,15 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// The 18 contract tokens, in the two stylesheets' own `--atlas-*` naming. The
-// contract table is 14 rows because each `state.*` row is a foreground on a
-// background, which is two variables: 14 + 4 = 18. Same list as the
-// `frontend/src/tokens.test.ts` in this repo, which checks one bridge against
-// the transcribed values; this checks the two bridges against each other.
+// The 20 tokens both bridges declare, in the two stylesheets' own `--atlas-*`
+// naming. The contract table is 14 rows because each `state.*` row is a
+// foreground on a background, which is two variables: 14 + 4 = 18. The contract's
+// one named `state.success` deviation adds a text/indicator pair on top, so 20.
+// The list is fixed rather than discovered, which is how those last two were
+// missed when the ERP contrast fix landed: a token a bridge adds is outside this
+// check until someone adds its name here. `frontend/src/tokens.test.ts` in this
+// repo checks one bridge against the transcribed values; this checks the two
+// bridges against each other.
 const TOKENS = [
   "--atlas-bg-canvas",
   "--atlas-bg-surface",
