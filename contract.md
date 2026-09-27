@@ -3,7 +3,7 @@
 ## Metadata
 
 - Product: Atlas ERP
-- Contract version: 1.4.0
+- Contract version: 1.4.1
 - Status: ACTIVE
 - Date: 2026-09-26
 - Approval date: 2026-09-26
@@ -268,8 +268,11 @@ another product's components to build.
 - Atlas ERP owns its PostgreSQL database, named `atlas_erp`.
 - It does not share tables with another application.
 - Local business data and domain state remain in the local database.
-- A durable local outbox is used for protocol events that need delivery to a
-  connected peer.
+- Protocol delivery is a direct synchronous call from the requesting product to
+  the product that owns the record. Nothing is queued for later delivery, and a
+  failed call is not retried on the caller's behalf. What is durable is a
+  receipt keyed on the request, so that a retry the caller chooses to make is
+  answered from stored state rather than by executing the work a second time.
 - Peers exchange data through the protocol; they do not read or write each
   other's tables directly.
 
@@ -359,6 +362,20 @@ another product's components to build.
   idempotent retry and from the owner being the sole authority for its own
   record, which is why the connected-sale receipt is the authoritative answer
   to "did this sale happen".
+- **The shipped connect path does not run the protocol module.** Measured against
+  this contract's vendored specification, 17 normative items resolve to one
+  implemented-and-tested, ten partial and five absent; none of the five
+  connection states exists in any form, including `revoked`, for which there is
+  no revocation operation at all. The guarantees that are implemented live in an
+  in-process module that no product or wire path calls, and the loopback
+  transport re-implements a thinner fragment of them under different keys — a
+  content-hash cursor where the module mints a position token, a request-keyed
+  receipt where the module keys an inbox by event id, and no role or grant check
+  on any route. Two of seven specification conformance targets are met. The
+  `audit.snapshot` capability the transport actually serves is not a registered
+  capability in the module, so it cannot be granted there. Until the transport
+  routes through the module, gate 3 is not met and the module's passing tests
+  are evidence about the module, not about this product's connect behavior.
 
 ## Amendment history
 
@@ -370,3 +387,4 @@ another product's components to build.
 | 1.2.0 | 2026-09-25 | Approved React/Vite/Tailwind/shadcn frontend direction and token mapping for both products. | ACTIVE |
 | 1.3.0 | 2026-09-26 | Approved legacy knowledge transfer rule, evolution map, cross-product ownership, token-parity requirement, and legacy transfer gate. | ACTIVE |
 | 1.4.0 | 2026-09-26 | Approved the separation and interoperability rules, the record of what crosses the boundary today, and the separation gate. | ACTIVE |
+| 1.4.1 | 2026-09-26 | Corrected a false claim that a durable local outbox exists. Delivery is a direct synchronous call and a request-keyed receipt is what is durable; recorded the measured finding that the shipped connect path bypasses the protocol module. | ACTIVE |
