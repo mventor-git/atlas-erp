@@ -3,7 +3,7 @@
 ## Metadata
 
 - Product: Atlas ERP
-- Contract version: 1.7.0
+- Contract version: 1.8.0
 - Status: ACTIVE
 - Date: 2026-09-26
 - Approval date: 2026-09-26
@@ -293,6 +293,41 @@ another product's components to build.
   is not permission to rewrite the backend, to move domain logic into the
   browser, or to share a database with another product.
 
+## UI and interaction standard
+
+Three platform standards govern the console, adopted by name and pinned at
+`ATLAS_UI_STANDARD_VERSION = "1.6.0"`: `UI_COMPONENT_STANDARD.md`,
+`VISUAL_ART_DIRECTION.md`, and `MOTION_ART_DIRECTION.md`.
+
+- The source of truth is `atlas-hq/docs/`. This product holds byte-identical
+  vendored copies under `docs/standards/`, and
+  `scripts/check-platform-standards-parity.mjs` fails if they drift from the
+  source. A copy follows the source; a mismatch is a defect, not a local edit.
+- **The token table in this contract stays the value authority.** The standards
+  define structure, behaviour, and rules and never restate a colour, spacing,
+  radius, duration, or easing value, so adopting them cannot introduce a new
+  token here. Where a standard and this contract's token table could be read as
+  disagreeing about a value, this contract wins.
+- These standards are a statement of intent, not a claim of conformance. One
+  known divergence is recorded below and the gate is not met until it is closed.
+
+### Known divergence: the dark-mode channel
+
+`UI_COMPONENT_STANDARD.md` §1.6 rule 29 forbids a `.dark` class, a class-strategy
+`darkMode`, and a Tailwind `dark:` variant anywhere in the codebase, on the
+grounds that a class toggle is a second, browser-owned theme channel that can
+disagree with the platform's own authority, and that the attribute is the
+supported mechanism.
+
+**This console still uses the class.** `frontend/src/index.css` declares
+`@custom-variant dark (&:is(.dark *))` and a `.dark` block, and the persisted
+mode is applied as a class by `frontend/src/lib/theme.tsx`. Migrating to the
+`data-theme` attribute touches the token blocks, the Tailwind variant
+declaration, the pre-paint script in `index.html`, the theme provider, and every
+`dark:` usage. The two mode blocks must also keep identical token names, and
+`color-scheme` must be set in the same block that sets the variables, so the
+migration is a single coherent change and not a find-and-replace.
+
 ## Data
 
 - Atlas ERP owns its PostgreSQL database, named `atlas_erp`.
@@ -350,6 +385,12 @@ another product's components to build.
    Every capability the peer names in a manifest is either implemented on the
    wire or recorded in *What crosses today*, and this product is fully usable
    with no peer connected.
+9. **UI and interaction standard:** the console resolves the three platform
+   standards named in *UI and interaction standard* from this product's
+   byte-identical vendored copies, those copies match the `atlas-hq/docs/`
+   source, every token still resolves to this contract's table rather than to a
+   value a standard restates, and the §1.6 dark-mode divergence recorded in that
+   section is closed. The gate is not met while that divergence stands.
 
 ## Risks and unknowns
 
@@ -421,3 +462,4 @@ another product's components to build.
 | 1.5.0 | 2026-09-26 | Added `audit` as a seventh baseline cluster for the read projection the connect transport serves, scoped read-only, and recorded that the projection-versus-composed-read modelling is a later decision. | ACTIVE |
 | 1.6.0 | 2026-09-26 | Corrected the record of what crosses: `sales.manual_sales` crosses as a proposal the owner decides, not as a command, because no peer may write a capability its owner is the sole master of. Recorded the open decision point and the process-local proposal ceiling. | ACTIVE |
 | 1.7.0 | 2026-09-26 | Authorised a protocol-owned durable store, `atlas_connect`, belonging to neither product, reachable only by the protocol adapter and scoped per peer, as the durable home of a crossing decision. Recorded that no crossing is atomic across the three databases. | ACTIVE |
+| 1.8.0 | 2026-09-26 | Adopted the three platform UI standards by name at `ATLAS_UI_STANDARD_VERSION` 1.6.0, with this contract's token table kept as the value authority, and recorded the §1.6 dark-mode divergence as an unmet part of the new gate. | ACTIVE |
