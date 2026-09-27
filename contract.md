@@ -3,7 +3,7 @@
 ## Metadata
 
 - Product: Atlas ERP
-- Contract version: 1.4.1
+- Contract version: 1.5.0
 - Status: ACTIVE
 - Date: 2026-09-26
 - Approval date: 2026-09-26
@@ -73,8 +73,14 @@ The product hierarchy is:
 `core -> cluster -> plugin -> module`
 
 The v1 baseline clusters are `masterdata`, `inventory`, `purchasing`, `sales`,
-`finance`, and `admin`. Atlas ERP has its own console and embeds the vendored
-`connect/SPEC.md`. Each cluster must be able to operate as part of the
+`finance`, `admin`, and `audit`. The `audit` cluster is the read projection the
+connect transport serves: it spans the item master, stock, sales, journals and
+movements rather than owning any one of them, and it is served read-only, so a
+manifest advertises `audit.snapshot:read` and never a write it cannot honour.
+Whether a cross-cutting projection should be modelled as one capability or as a
+read composed over the capabilities it spans is a later decision; the name and
+its read-only scope are fixed here. Atlas ERP has its own console and embeds the
+vendored `connect/SPEC.md`. Each cluster must be able to operate as part of the
 standalone application; Atlas Connect is additive and is never a required
 runtime dependency.
 
@@ -388,3 +394,4 @@ another product's components to build.
 | 1.3.0 | 2026-09-26 | Approved legacy knowledge transfer rule, evolution map, cross-product ownership, token-parity requirement, and legacy transfer gate. | ACTIVE |
 | 1.4.0 | 2026-09-26 | Approved the separation and interoperability rules, the record of what crosses the boundary today, and the separation gate. | ACTIVE |
 | 1.4.1 | 2026-09-26 | Corrected a false claim that a durable local outbox exists. Delivery is a direct synchronous call and a request-keyed receipt is what is durable; recorded the measured finding that the shipped connect path bypasses the protocol module. | ACTIVE |
+| 1.5.0 | 2026-09-26 | Added `audit` as a seventh baseline cluster for the read projection the connect transport serves, scoped read-only, and recorded that the projection-versus-composed-read modelling is a later decision. | ACTIVE |
