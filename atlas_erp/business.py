@@ -455,11 +455,16 @@ class AuditSnapshot:
 
 
 _BUSINESS_MODULES = (
-    ("masterdata.items", "masterdata", "catalog", "items"),
-    ("purchasing.purchase_orders", "purchasing", "orders", "purchase-orders"),
-    ("inventory.stock", "inventory", "stock", "availability"),
-    ("sales.manual_sales", "sales", "sales", "manual-sales"),
-    ("finance.journals", "finance", "journals", "general-ledger"),
+    ("masterdata.items", "masterdata", "catalog", "items", frozenset({"read", "write"})),
+    ("purchasing.purchase_orders", "purchasing", "orders", "purchase-orders", frozenset({"read", "write"})),
+    ("inventory.stock", "inventory", "stock", "availability", frozenset({"read", "write"})),
+    ("sales.manual_sales", "sales", "sales", "manual-sales", frozenset({"read", "write"})),
+    ("finance.journals", "finance", "journals", "general-ledger", frozenset({"read", "write"})),
+    # Read-only because the transport serves it as a projection and has no
+    # write for it: a manifest that advertised ``audit.snapshot:write`` would
+    # promise a grant that can never be honoured once a peer's grant is
+    # actually checked against this set.
+    ("audit.snapshot", "audit", "reports", "snapshot", frozenset({"read"})),
 )
 
 
@@ -471,7 +476,7 @@ def register_business_capabilities(registry: Registry) -> Registry:
     """
 
     existing_capabilities = cast(Iterable[object], registry.manifest()["capabilities"])
-    for capability, cluster_name, plugin_name, module_name in _BUSINESS_MODULES:
+    for capability, cluster_name, plugin_name, module_name, permissions in _BUSINESS_MODULES:
         if capability in existing_capabilities:
             continue
         if cluster_name not in registry.cluster_names:
@@ -484,7 +489,7 @@ def register_business_capabilities(registry: Registry) -> Registry:
             cluster_name,
             plugin_name,
             module_name,
-            {capability: {"read", "write"}},
+            {capability: set(permissions)},
         )
     return registry
 

@@ -164,12 +164,26 @@ class BusinessPathTests(unittest.TestCase):
                 "inventory.stock",
                 "sales.manual_sales",
                 "finance.journals",
+                "audit.snapshot",
             },
         )
         self.assertEqual(business.purchase_orders, {})
         self.assertEqual(business.receipts, {})
         self.assertEqual(business.sales, {})
         self.assertEqual(business.journals, {})
+
+    def test_the_manifest_advertises_only_permissions_a_capability_actually_has(self) -> None:
+        # A manifest is a promise a peer's grant is checked against, so a
+        # capability that is served read-only must not also advertise a write.
+        # ``audit.snapshot`` is the transport's read projection and has no write
+        # route, so advertising one would be a grant that can never be honoured.
+        manifest = Business(Registry()).registry.manifest()
+        advertised = cast(dict[str, list[str]], manifest["permissions"])
+
+        self.assertEqual(advertised["audit.snapshot"], ["read"])
+        for capability in set(advertised) - {"audit.snapshot"}:
+            with self.subTest(capability=capability):
+                self.assertEqual(advertised[capability], ["read", "write"])
 
     def test_manual_sale_decrements_stock_and_posts_balanced_journal(self) -> None:
         order = self.business.create_purchase_order(
