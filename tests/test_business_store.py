@@ -16,6 +16,8 @@ import os
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
+from typing import cast
 from uuid import uuid4
 
 from atlas_erp import (
@@ -25,7 +27,7 @@ from atlas_erp import (
     PostgresBusinessStore,
     snapshot_cursor,
 )
-from atlas_erp.connect_server import _seed_business_store
+from atlas_erp.connect_server import ConnectHandler, _seed_business_store
 
 DATABASE_ENV = "ATLAS_ERP_DATABASE_URL"
 # The tables the store owns.  A test reads them; it never creates them.
@@ -66,6 +68,40 @@ RECEIPT_REASON = "receipt"
 
 def _database_url() -> str:
     return os.environ.get(DATABASE_ENV, "")
+
+
+def _post_a_connected_sale(business: Business, prefix: str) -> str:
+    """Post one further sale on the fixture and return its ``sale_id``.
+
+    The first item is left holding stock, so this is an ordinary sale; its id
+    carries the prefix the per-test cleanup deletes by, as the fixture's do.
+    """
+
+    sale_id = f"{prefix}-sale-connected"
+    business.create_manual_sale(
+        "customer-connected",
+        [{"item_id": f"{prefix}-item-1", "quantity": 1, "unit_price_cents": 1250}],
+        sale_id=sale_id,
+    )
+    return sale_id
+
+
+def _write_business_state(business: Business, store: BusinessStore, sale_id: str) -> None:
+    """Drive the connect handler's durable write for one posted sale.
+
+    The socket and the receipt are not what is under test and the serving path
+    is pinned by ``test_connect_server``; this write reads exactly two
+    attributes off its server, so the handler is stood in for rather than
+    served.
+    """
+
+    handler = cast(
+        "ConnectHandler",
+        SimpleNamespace(
+            server=SimpleNamespace(business=business, business_store=store)
+        ),
+    )
+    ConnectHandler._write_business_state(handler, sale_id)
 
 
 class BusinessStoreRoundTrip:
@@ -372,6 +408,33 @@ class InMemoryBusinessStoreTests(BusinessStoreRoundTrip, unittest.TestCase):
         self.assertEqual(len(store.load().purchase_orders), 3)
         self.assertEqual(len(store.load().receipts), 2)
 
+    def test_a_posted_sale_is_written_through_one_transaction(self) -> None:
+        # An in-memory transaction rolls nothing back, so what is pinned here is
+        # the shape rather than the rollback: the sale and its movements are one
+        # unit of work, and all three are still written.  The rollback itself
+        # needs a real database, and is pinned there.
+        business = self.build_business()
+        sale_id = _post_a_connected_sale(business, self.prefix)
+        store = _TransactionCountingStore()
+
+        _write_business_state(business, store, sale_id)
+
+        self.assertEqual(store.transactions, 1)
+        records = store.load()
+        self.assertIn(sale_id, [sale.sale_id for sale in records.sales])
+        self.assertIn(
+            business.get_journal_for_sale(sale_id).journal_id,
+            [entry.journal_id for entry in records.journals],
+        )
+        self.assertEqual(
+            [
+                movement.movement_id
+                for movement in records.stock_movements
+                if movement.reference_id == sale_id
+            ],
+            [movement.movement_id for movement in business.sale_movements(sale_id)],
+        )
+
     def test_ensure_schema_and_close_may_be_called_more_than_once(self) -> None:
         store = self.open_store()
 
@@ -402,6 +465,13 @@ class _RefusingReceiptStore(PostgresBusinessStore):
         raise RuntimeError("the receipt write was refused")
 
 
+class _RefusingMovementStore(PostgresBusinessStore):
+    """A durable store whose movement write fails, to pin the sale write's edge."""
+
+    def save_movements(self, movements: object) -> None:
+        raise RuntimeError("the movement write was refused")
+
+
 @unittest.skipUnless(_database_url(), f"set {DATABASE_ENV} to run")
 class PostgresBusinessStoreTests(BusinessStoreRoundTrip, unittest.TestCase):
     """Durability tests against the real temporary PostgreSQL instance."""
@@ -413,22 +483,21 @@ class PostgresBusinessStoreTests(BusinessStoreRoundTrip, unittest.TestCase):
     def _delete_own_rows(self) -> None:
         import psycopg
 
-        journal_ids = [
-            f"journal-{self.prefix}-sale-{suffix}" for suffix in RECORDED_SALE_SUFFIXES
-        ]
         with psycopg.connect(_database_url()) as connection:
             # The line tables carry no foreign key, so they go by id first.
             connection.execute(
                 "DELETE FROM sale_lines WHERE sale_id LIKE %s", (f"{self.prefix}%",)
             )
             connection.execute(
-                "DELETE FROM journal_lines WHERE journal_id = ANY(%s)", (journal_ids,)
+                "DELETE FROM journal_lines WHERE journal_id LIKE %s",
+                (f"journal-{self.prefix}%",),
             )
             connection.execute(
                 "DELETE FROM sales WHERE sale_id LIKE %s", (f"{self.prefix}%",)
             )
             connection.execute(
-                "DELETE FROM journal_entries WHERE journal_id = ANY(%s)", (journal_ids,)
+                "DELETE FROM journal_entries WHERE journal_id LIKE %s",
+                (f"journal-{self.prefix}%",),
             )
             connection.execute(
                 "DELETE FROM stock_movements WHERE reference_id LIKE %s",
@@ -486,6 +555,49 @@ class PostgresBusinessStoreTests(BusinessStoreRoundTrip, unittest.TestCase):
         self.assertEqual(store.load().purchase_orders, ())
         self.assertEqual(store.load().receipts, ())
         self.assertEqual(store.load().stock_movements, ())
+
+    def test_a_refused_movement_write_leaves_no_sale_and_no_journal(self) -> None:
+        # Stock is a sum over the movement rows rather than a stored level, so a
+        # durable sale whose movements never landed is not a loud half-write: it
+        # is a number that is now permanently too high, with nothing to correct
+        # it and nothing to notice.  The sale and the movements are therefore
+        # one unit of work, or neither is.
+        business = self.build_business()
+        sale_id = _post_a_connected_sale(business, self.prefix)
+        refusing = _RefusingMovementStore(_database_url())
+        self.addCleanup(refusing.close)
+
+        with self.assertRaises(RuntimeError):
+            _write_business_state(business, refusing, sale_id)
+
+        # A second store on its own connection, so this reads what was committed
+        # rather than anything the failing connection still believes.
+        observer = self.open_store()
+        records = observer.load()
+        self.assertNotIn(sale_id, [sale.sale_id for sale in records.sales])
+        self.assertNotIn(
+            business.get_journal_for_sale(sale_id).journal_id,
+            [entry.journal_id for entry in records.journals],
+        )
+
+        # The same write, same sale, on a store that accepts it lands all three.
+        # So the refusal is what left nothing behind, and not a write that was
+        # made to write nothing.
+        _write_business_state(business, self.open_store(), sale_id)
+        written = observer.load()
+        self.assertIn(sale_id, [sale.sale_id for sale in written.sales])
+        self.assertIn(
+            business.get_journal_for_sale(sale_id).journal_id,
+            [entry.journal_id for entry in written.journals],
+        )
+        self.assertEqual(
+            [
+                movement.movement_id
+                for movement in written.stock_movements
+                if movement.reference_id == sale_id
+            ],
+            [movement.movement_id for movement in business.sale_movements(sale_id)],
+        )
 
     def test_recorded_order_is_returned_rather_than_id_order(self) -> None:
         _assert_recorded_order_is_returned(self, self)

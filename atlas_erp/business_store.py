@@ -199,10 +199,10 @@ class BusinessStore(Protocol):
     record is written as the domain produced it, and a duplicate key is a caller
     error the adapter's own error reports.
 
-    :meth:`transaction` exists for the boot seed, which has to write a whole
-    fixture or nothing.  It is the one way to make several :meth:`save_...` calls
-    a single unit of work; a write made outside it is one transaction per call,
-    which is the known ceiling below.
+    :meth:`transaction` exists for the boot seed and for a posted sale, either of
+    which has to be all or nothing.  It is the one way to make several
+    :meth:`save_...` calls a single unit of work; a write made outside it is one
+    transaction per call.
 
     Known ceiling: a connected sale is still not atomic *with its receipt* in the
     sale store, so a crash can leave business state ahead of a ``pending``

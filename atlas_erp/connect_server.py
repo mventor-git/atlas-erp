@@ -393,6 +393,12 @@ class ConnectHandler(BaseHTTPRequestHandler):
         only state there is.  The movements are read back off the domain rather
         than rebuilt, so the durable movement ids are the ones the domain
         itself minted.
+
+        The sale, its journal, and its movements are one transaction because
+        stock is a sum over the movement rows rather than a stored level: a
+        durable sale whose movements never landed is not a loud half-write but a
+        number that is now permanently too high, and no later restart corrects
+        it.  A crash between two bare calls would be exactly that.
         """
 
         store = self.server.business_store
@@ -400,8 +406,9 @@ class ConnectHandler(BaseHTTPRequestHandler):
             return
         business = self.server.business
         sale = business.get_sale(sale_id)
-        store.save_sale(sale, business.get_journal_for_sale(sale_id))
-        store.save_movements(business.sale_movements(sale_id))
+        with store.transaction():
+            store.save_sale(sale, business.get_journal_for_sale(sale_id))
+            store.save_movements(business.sale_movements(sale_id))
 
     def _create_manual_sale(
         self, request: tuple[str, str, list[dict[str, object]]]
@@ -871,10 +878,10 @@ def _seed_business_store(store: BusinessStore, business: Business) -> None:
 
     The whole seed is one transaction because the next boot trusts whatever is
     there: a seed interrupted half way would otherwise leave a partial store that
-    the next boot restores as truth.  ponytail: a connected sale is still written
-    outside any such block, so a crash can leave business state ahead of a
-    ``pending`` receipt; merging the two stores into one transaction is a later
-    slice.
+    the next boot restores as truth.  ponytail: a connected sale is one such block
+    too, but it is not the *same* block as its receipt, so a crash can still
+    leave business state ahead of a ``pending`` receipt; merging the two stores
+    into one transaction is a later slice.
     """
 
     with store.transaction():
