@@ -3,7 +3,7 @@
 ## Metadata
 
 - Product: Atlas ERP
-- Contract version: 1.3.0
+- Contract version: 1.4.0
 - Status: ACTIVE
 - Date: 2026-09-26
 - Approval date: 2026-09-26
@@ -80,6 +80,60 @@ runtime dependency.
 
 Connect is share-only by default. Adoption or import of data owned by another
 application is a separate, explicit operation.
+
+## Separation and interoperability
+
+Two products share a platform and a protocol. They do not share data, and the
+line between them is drawn where ownership is rather than where it is
+convenient.
+
+### What keeps the products separate
+
+- Each product owns exactly one database and never reads or writes the peer's
+  tables. There is no cross-database query, join, trigger, or replication
+  between them, and adding one is a contract amendment.
+- Capability sets are disjoint by construction. Every cluster or capability
+  named as a non-goal of this product is another product's responsibility, and
+  the boundary does not move to make a feature cheaper to build.
+- The products are separately deployable. Each runs in its own runtime with its
+  own dependencies, frontend builds, and lockfiles, and each is fully useful
+  with no peer connected and no peer reachable.
+- There is no distributed transaction across the boundary. Work committed on
+  one side is durable on that side alone, and a crossing that spans both sides
+  is made safe by idempotency and reconciliation rather than a two-phase
+  commit.
+
+### What crosses the boundary
+
+- The protocol is the only channel. No shared filesystem, no direct database
+  access, and no side channel carries product data between them.
+- Direction carries meaning. A command travels toward the owner of the record
+  it changes; a read projection travels back to the requester. A product never
+  asks its peer to decide something the requester owns.
+- Exactly three kinds of thing cross: a read projection, a command, and a
+  proposal. Each names its owning product, and each is either idempotent under
+  retry or explicitly reconcilable after a failure.
+- Idempotency is the receiving product's responsibility, keyed so a retry is
+  answerable from durable state rather than by re-executing the work. The key
+  is derived deterministically from the request, so one request cannot become
+  two records.
+- A declared capability is not an implemented crossing. Naming a capability in
+  a manifest states an intent to interoperate, not that the capability can be
+  read or invoked over the wire today.
+
+### What crosses today
+
+- The kernel is implemented: major-version handshake, manifest validation,
+  share-only pairing, explicit `master`/`reader`/`proposer` authority,
+  snapshots behind an opaque cursor, ordered deltas, idempotent inbox handling
+  by event id, and proposal transitions.
+- Exactly two capabilities are implemented on the wire, and they are the whole
+  of it: `audit.snapshot`, read from its owner, and `sales.manual_sales`, a
+  single command submitted to its owner.
+- Peering is asymmetric. This product serves both implemented capabilities and
+  its peer serves none; the serving side is the authority for every record it
+  owns. A manifest names an intent, and this section — not a manifest —
+  records what interoperates.
 
 ## Evolution map
 
@@ -258,6 +312,11 @@ another product's components to build.
    stated invariant, a named owning cluster, explicit failure semantics, a real
    test that runs, and defined UI states for loading, empty, error, and success.
    An absent, skipped, or stubbed test is not evidence for the gate.
+8. **Separation and interoperability:** this product shares no table, database,
+   or filesystem with a peer, and the protocol is the only channel between them.
+   Every capability the peer names in a manifest is either implemented on the
+   wire or recorded in *What crosses today*, and this product is fully usable
+   with no peer connected.
 
 ## Risks and unknowns
 
@@ -289,7 +348,17 @@ another product's components to build.
   `tokens:parity` script, so a mapping edited in one product and not the other
   fails that check instead of drifting silently. The risk stays open because
   no automated run invokes the check and it compares the two bridges to each
-  other rather than to the token table above.
+   other rather than to the token table above.
+- A manifest can name a capability the wire does not carry, and a reader who
+  trusts the manifest will believe an integration works. The wire is the truth
+  and *What crosses today* is the record; the manifests in both products are
+  wider than the two implemented crossings, and nothing in the protocol
+  currently fails when one grows further.
+- A crossing spans two databases, so a failure between them cannot be rolled
+  back as a unit and no two-phase commit is attempted. Safety comes from
+  idempotent retry and from the owner being the sole authority for its own
+  record, which is why the connected-sale receipt is the authoritative answer
+  to "did this sale happen".
 
 ## Amendment history
 
@@ -300,3 +369,4 @@ another product's components to build.
 | 1.1.1 | 2026-09-25 | Expanded shared UI token table, derived contrast-safe values, and preferred shadcn/ui foundation. | ACTIVE |
 | 1.2.0 | 2026-09-25 | Approved React/Vite/Tailwind/shadcn frontend direction and token mapping for both products. | ACTIVE |
 | 1.3.0 | 2026-09-26 | Approved legacy knowledge transfer rule, evolution map, cross-product ownership, token-parity requirement, and legacy transfer gate. | ACTIVE |
+| 1.4.0 | 2026-09-26 | Approved the separation and interoperability rules, the record of what crosses the boundary today, and the separation gate. | ACTIVE |
