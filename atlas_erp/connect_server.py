@@ -69,14 +69,24 @@ class _RequestError(Exception):
     """One client-caused request problem, mapped to a status and error code.
 
     ``close`` marks the cases where the request body was not read, so the
-    connection cannot be reused for another request.
+    connection cannot be reused for another request.  ``headers`` carries the
+    response headers the status implies, such as the wait a retrying caller
+    needs, so the hint is in the standard place rather than in the body.
     """
 
-    def __init__(self, status: int, code: str, *, close: bool = False) -> None:
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        *,
+        close: bool = False,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         super().__init__(code)
         self.status = status
         self.code = code
         self.close = close
+        self.headers = headers
 
 
 def _canonical_json(value: object) -> bytes:
@@ -324,7 +334,7 @@ class ConnectHandler(BaseHTTPRequestHandler):
         except _RequestError as error:
             if error.close:
                 self.close_connection = True
-            self._send_json(error.status, {"error": error.code})
+            self._send_json(error.status, {"error": error.code}, headers=error.headers)
             return
         except Exception:
             # Never leak an internal failure detail to the caller.
@@ -354,7 +364,15 @@ class ConnectHandler(BaseHTTPRequestHandler):
         if reservation.outcome == PAYLOAD_CONFLICT:
             raise _RequestError(409, "sale id conflict")
         if reservation.outcome == IN_PROGRESS:
-            raise _RequestError(409, "sale in progress")
+            # The holder's lease is the wait, and ``Retry-After`` is where a
+            # caller reads one, so a retrying peer is not left guessing.  The
+            # hint is a header rather than body content because the body is the
+            # stable error shape a client parses once.
+            raise _RequestError(
+                409,
+                "sale in progress",
+                headers=_retry_after(reservation.retry_after_seconds),
+            )
         try:
             payload = self._create_manual_sale(request)
             # The durable write comes before the receipt on purpose: a store
@@ -576,7 +594,7 @@ class ConnectHandler(BaseHTTPRequestHandler):
         status: int,
         payload: object,
         *,
-        headers: dict[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         body = json.dumps(
             payload,
@@ -592,6 +610,17 @@ class ConnectHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if getattr(self, "command", None) != "HEAD":
             self.wfile.write(body)
+
+
+def _retry_after(seconds: int | None) -> dict[str, str] | None:
+    """Return the ``Retry-After`` header for a wait hint, or no header at all.
+
+    A store that reports no wait has nothing to say about when to try again, and
+    an invented value would be worse than none, so the header is simply absent
+    rather than defaulted to zero.
+    """
+
+    return None if seconds is None else {"Retry-After": str(seconds)}
 
 
 def _make_server(

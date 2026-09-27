@@ -36,7 +36,7 @@ class InvalidPriceError(BusinessError):
 
 
 class InvalidOrderError(BusinessError):
-    """Raised when a purchase order has no usable lines."""
+    """Raised when a purchase order or receipt is malformed or has no usable lines."""
 
 
 class DuplicateOrderError(BusinessError):
@@ -96,6 +96,13 @@ JOURNAL_ACCOUNT_CODES = frozenset(
     {CASH_ACCOUNT_CODE, REVENUE_ACCOUNT_CODE}
 )
 
+# The states the purchasing records are actually produced in: the two the
+# default and :meth:`Business.receive_purchase_order` set on an order, and the
+# one a receipt is born with.  Nothing else sets either field, so a stored
+# value outside these sets is a corrupt row rather than a state the domain has.
+PURCHASE_ORDER_STATES = frozenset({"open", "received"})
+RECEIPT_STATES = frozenset({"received"})
+
 
 @dataclass(frozen=True)
 class MasterItem:
@@ -116,21 +123,50 @@ class MasterItem:
 
 @dataclass(frozen=True)
 class PurchaseOrderLine:
-    """An item and its ordered quantity."""
+    """An item and its ordered quantity.
+
+    Validated here as well as in :func:`_line` because a reloaded record never
+    goes through :meth:`Business.create_purchase_order`: this constructor is
+    the only check that row gets, so a non-positive or non-integer quantity
+    fails the reload instead of moving stock by a plausible wrong number.
+    """
 
     item_id: str
     quantity: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "item_id", _text(self.item_id, "item_id"))
+        object.__setattr__(self, "quantity", _quantity(self.quantity))
+
 
 @dataclass(frozen=True)
 class PurchaseOrder:
-    """The state of a purchase order in the local domain."""
+    """The state of a purchase order in the local domain.
+
+    ``state`` is validated against :data:`PURCHASE_ORDER_STATES` and ``lines``
+    may not be empty, which is the second net under ``create_purchase_order``:
+    :meth:`Business.restore` rebuilds through this constructor, so a stored row
+    with no id, no lines, or a state the domain never produces fails the reload
+    loudly rather than restoring an order nothing can be received against.
+    """
 
     order_id: str
     supplier_id: str
     lines: tuple[PurchaseOrderLine, ...]
     state: str = "open"
     receipt_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "order_id", _text(self.order_id, "order_id"))
+        object.__setattr__(self, "supplier_id", _text(self.supplier_id, "supplier_id"))
+        object.__setattr__(self, "lines", _purchasing_lines(self.lines, "purchase order"))
+        object.__setattr__(
+            self,
+            "state",
+            _purchasing_state(self.state, PURCHASE_ORDER_STATES, "purchase order state"),
+        )
+        if self.receipt_id is not None:
+            object.__setattr__(self, "receipt_id", _text(self.receipt_id, "receipt_id"))
 
     @property
     def is_received(self) -> bool:
@@ -139,12 +175,28 @@ class PurchaseOrder:
 
 @dataclass(frozen=True)
 class Receipt:
-    """The immutable movement created when an order is received."""
+    """The immutable movement created when an order is received.
+
+    A receipt exists only once an order has been received, so its ``state`` is
+    checked against :data:`RECEIPT_STATES` for the same reason the order's is:
+    the reload path runs no factory method, and a receipt whose stock movements
+    already exist is the one record that must not come back meaningless.
+    """
 
     receipt_id: str
     order_id: str
     lines: tuple[PurchaseOrderLine, ...]
     state: str = "received"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "receipt_id", _text(self.receipt_id, "receipt_id"))
+        object.__setattr__(self, "order_id", _text(self.order_id, "order_id"))
+        object.__setattr__(self, "lines", _purchasing_lines(self.lines, "receipt"))
+        object.__setattr__(
+            self,
+            "state",
+            _purchasing_state(self.state, RECEIPT_STATES, "receipt state"),
+        )
 
 
 @dataclass(frozen=True)
@@ -469,6 +521,41 @@ def _journal_cents(value: object, kind: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise InvalidJournalEntryError(f"{kind} must be a non-negative integer")
     return value
+
+
+def _purchasing_lines(value: object, kind: str) -> tuple[PurchaseOrderLine, ...]:
+    """Return the lines of a stored purchasing record, or refuse the record.
+
+    An empty tuple is refused as well as a malformed line: the domain never
+    creates a purchasing record without lines, so an empty one is a partial row
+    rather than a legitimate order.
+
+    Every accepted line is rebuilt through :class:`PurchaseOrderLine` rather
+    than kept as it arrived.  That is the whole point of the check: a stored
+    ``PurchaseOrderLine`` reaches this function as an object that already
+    exists, so an ``isinstance`` test alone would wave through a quantity that
+    was corrupted after its own constructor ran, and the reload would move stock
+    by that number.
+    """
+
+    try:
+        lines = tuple(value)  # type: ignore[call-overload]
+    except TypeError as exc:
+        raise InvalidOrderError(f"{kind} lines must be an iterable") from exc
+    if not lines:
+        raise InvalidOrderError(f"{kind} must contain at least one line")
+    if not all(isinstance(line, PurchaseOrderLine) for line in lines):
+        raise InvalidOrderError(f"{kind} must contain valid purchase order lines")
+    return tuple(_line(line) for line in lines)
+
+
+def _purchasing_state(value: object, allowed: frozenset[str], kind: str) -> str:
+    """Return a purchasing ``state`` the domain actually produces, or refuse it."""
+
+    state = _text(value, kind)
+    if state not in allowed:
+        raise InvalidOrderError(f"unsupported {kind}: {state}")
+    return state
 
 
 def _line(value: object) -> PurchaseOrderLine:
@@ -984,8 +1071,10 @@ __all__ = [
     "JournalEntry",
     "JournalLine",
     "MasterItem",
+    "PURCHASE_ORDER_STATES",
     "PurchaseOrder",
     "PurchaseOrderLine",
+    "RECEIPT_STATES",
     "REVENUE_ACCOUNT",
     "REVENUE_ACCOUNT_CODE",
     "Receipt",

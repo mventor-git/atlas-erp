@@ -1,5 +1,6 @@
 import io
 import json
+import time
 import unittest
 from collections.abc import Iterable, Mapping
 from http.client import HTTPConnection, HTTPMessage, parse_headers
@@ -26,6 +27,7 @@ from atlas_erp.connect_server import (
     _RequestError,
     _seed_business_store,
 )
+from atlas_erp.sale_store import DEFAULT_LEASE_SECONDS
 
 
 _MISSING = object()
@@ -506,10 +508,15 @@ class ConnectHandlerTests(unittest.TestCase):
         )
         self.assertEqual(reservation.outcome, RESERVED)
 
-        status, _, payload = self.post_sale(body, server=server)
+        status, headers, payload = self.post_sale(body, server=server)
 
         self.assertEqual(status, 409)
         self.assertEqual(payload, {"error": "sale in progress"})
+        # The holder's lease reaches the wire as Retry-After, so a retrying peer
+        # is told how long to wait rather than left to guess, and the error body
+        # stays the one shape a client parses.
+        self.assertEqual(headers.get("Retry-After"), str(DEFAULT_LEASE_SECONDS))
+        self.assertNotIn("retry", payload)
         self.assertEqual(list(self.business.sales), ["sale-http-1"])
         self.assertEqual(self.business.stock, {"item-1": 1})
 
@@ -594,6 +601,47 @@ class ConnectHandlerTests(unittest.TestCase):
             ).outcome,
             RESERVED,
         )
+
+    def test_a_reclaimed_key_cannot_post_a_second_sale_for_the_same_sale_id(self) -> None:
+        # The safety argument for reclaiming at all, on this side of it.  A peer
+        # derives its sale_id from the caller's key, so a retry after a reclaim
+        # re-posts the *same* sale_id, and the domain refuses the repeat.  This
+        # is the worst case the lease allows: the first attempt got as far as
+        # posting the sale and then died before completing its receipt, so the
+        # reclaim finds a domain that already holds the sale.
+        store = InMemorySaleCommandStore(lease_seconds=1)
+        server = self.store_server(store)
+        body = self.sale_body()
+        lines = cast(list[dict[str, object]], body["lines"])
+        request = ("customer-http-2", "sale-http-2", lines)
+
+        # The crashed attempt: reserved, posted, never completed.
+        self.assertEqual(store.reserve("sale-http-2", sale_command_hash(request)).outcome, RESERVED)
+        self.business.create_manual_sale("customer-http-2", lines, sale_id="sale-http-2")
+
+        time.sleep(1.05)
+
+        # The retry reclaims the key on its way in, so it reaches the domain,
+        # which already holds that sale_id.
+        status, headers, payload = self.post_sale(body, server=server)
+
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"error": "duplicate sale"})
+        # It got past the reservation, so it was not answered as in progress.
+        self.assertNotIn("Retry-After", headers)
+        # One sale, one stock movement: the reclaim duplicated a claim, never a
+        # sale.  The failed attempt also released the key rather than burning it.
+        self.assertEqual(len(self.business.sales), 2)
+        self.assertEqual(
+            [
+                movement.quantity_delta
+                for movement in self.business.stock_movements.values()
+                if movement.reference_id == "sale-http-2"
+            ],
+            [-1],
+        )
+        self.assertEqual(self.business.stock, {"item-1": 0})
+        self.assertEqual(store.reserve("sale-http-2", sale_command_hash(request)).outcome, RESERVED)
 
     def test_a_rejected_content_type_lets_the_client_read_the_response(self) -> None:
         # Answering before the request body is read makes Windows reset the

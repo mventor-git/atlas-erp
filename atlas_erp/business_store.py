@@ -59,6 +59,16 @@ if TYPE_CHECKING:
 # The tables this module owns.  Every name is a literal here on purpose: no
 # caller-supplied value ever reaches a table or column name.  ``seq`` is the
 # insertion order the domain has no other way to express.
+#
+# The two ``state`` checks below are the database half of the purchasing
+# validation in :mod:`atlas_erp.business`, and they list the same states as
+# ``PURCHASE_ORDER_STATES`` and ``RECEIPT_STATES`` there, which is how
+# ``sale_store``'s ``status`` check is written too: the values are repeated
+# deliberately rather than interpolated, so the DDL stays a readable literal.
+# ponytail: ``ensure_schema`` is ``CREATE TABLE IF NOT EXISTS``, so a table
+# created before these checks existed keeps the wider column and never gains
+# them; that is a missing migration runner, which is a recorded undone item,
+# not a table rename to paper over.
 CREATE_ITEMS_SQL = """
 CREATE TABLE IF NOT EXISTS master_items (
     seq bigserial PRIMARY KEY,
@@ -121,7 +131,7 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
     seq bigserial PRIMARY KEY,
     order_id text NOT NULL UNIQUE,
     supplier_id text NOT NULL,
-    state text NOT NULL,
+    state text NOT NULL CHECK (state IN ('open', 'received')),
     receipt_id text
 );
 
@@ -139,7 +149,7 @@ CREATE TABLE IF NOT EXISTS receipts (
     seq bigserial PRIMARY KEY,
     receipt_id text NOT NULL UNIQUE,
     order_id text NOT NULL,
-    state text NOT NULL
+    state text NOT NULL CHECK (state IN ('received'))
 );
 
 CREATE TABLE IF NOT EXISTS receipt_lines (

@@ -3,7 +3,7 @@ import unittest
 from contextlib import redirect_stdout
 from dataclasses import FrozenInstanceError
 from io import StringIO
-from typing import cast
+from typing import Any, cast
 
 from atlas_erp import (
     CASH_ACCOUNT_CODE,
@@ -20,9 +20,12 @@ from atlas_erp import (
     InvalidPriceError,
     InvalidQuantityError,
     InvalidSaleError,
+    InMemoryBusinessStore,
     JournalEntry,
     JournalLine,
     MasterItem,
+    PurchaseOrder,
+    PurchaseOrderLine,
     Receipt,
     Registry,
     StockLevel,
@@ -31,6 +34,7 @@ from atlas_erp import (
     UnknownOrderError,
 )
 from atlas_erp.__main__ import main as standalone_main
+from atlas_erp.business import PURCHASE_ORDER_STATES, RECEIPT_STATES
 
 
 class BusinessPathTests(unittest.TestCase):
@@ -792,6 +796,241 @@ class BusinessRestoreTests(unittest.TestCase):
         # A reader over recorded state, not a lookup: an id nothing produced
         # answers an empty tuple rather than raising.
         self.assertEqual(restored.sale_movements("sale-never-posted"), ())
+
+
+class PurchasingRecordValidationTests(unittest.TestCase):
+    """The three constructors a reloaded purchasing record is rebuilt through.
+
+    ``PurchaseOrderLine``, ``PurchaseOrder``, and ``Receipt`` are the only checks
+    a stored row gets, because :meth:`Business.restore` runs no factory method:
+    ``create_purchase_order`` and ``receive_purchase_order`` validate on the way
+    in, and then the same records come back out of a store straight into these
+    constructors.  A row that skipped them would otherwise restore as a
+    plausible wrong value -- an order with no id that nothing can be received
+    against, or a quantity of zero that moves no stock.
+    """
+
+    def setUp(self) -> None:
+        self.line = PurchaseOrderLine("item-1", 2)
+        self.lines = (self.line,)
+        self.order = PurchaseOrder("po-validate-1", "supplier-1", self.lines)
+        self.receipt = Receipt("receipt-validate-1", "po-validate-1", self.lines)
+
+    def test_a_line_refuses_an_empty_item_id(self) -> None:
+        for item_id in ("", "   "):
+            with self.subTest(item_id=item_id):
+                # _text, so the base BusinessError, not a new error type.
+                with self.assertRaises(BusinessError) as raised:
+                    PurchaseOrderLine(item_id, 2)
+                self.assertIs(type(raised.exception), BusinessError)
+
+    def test_a_line_refuses_a_non_positive_or_non_integer_quantity(self) -> None:
+        for quantity in (0, -1, 1.5, "2", None, True):
+            with self.subTest(quantity=quantity):
+                # True is a bool, which is an int, and must still be refused.
+                with self.assertRaises(InvalidQuantityError):
+                    PurchaseOrderLine("item-1", quantity)  # type: ignore[arg-type]
+
+    def test_an_order_refuses_an_empty_order_id_or_supplier_id(self) -> None:
+        for order_id in ("", "  "):
+            with self.subTest(order_id=order_id):
+                with self.assertRaises(BusinessError) as raised:
+                    PurchaseOrder(order_id, "supplier-1", self.lines)
+                self.assertIs(type(raised.exception), BusinessError)
+        with self.assertRaises(BusinessError) as raised:
+            PurchaseOrder("po-validate-2", "   ", self.lines)
+        self.assertIs(type(raised.exception), BusinessError)
+
+    def test_an_order_refuses_no_lines(self) -> None:
+        # The domain never creates an order without lines, so an empty tuple is a
+        # partial row rather than a legitimate order.
+        with self.assertRaises(InvalidOrderError):
+            PurchaseOrder("po-validate-3", "supplier-1", ())
+        # And a line that is not a purchasing line is refused rather than
+        # reaching the stored quantity as something else entirely.
+        not_a_line: tuple[object, ...] = ("item-1",)
+        with self.assertRaises(InvalidOrderError):
+            PurchaseOrder("po-validate-4", "supplier-1", cast("Any", not_a_line))
+
+    def test_an_order_refuses_a_state_the_domain_does_not_produce(self) -> None:
+        self.assertEqual(PURCHASE_ORDER_STATES, {"open", "received"})
+        # A state the domain never produces is an order error, which is a
+        # BusinessError and therefore never a bare ValueError.
+        for state in ("cancelled", "OPEN", "draft"):
+            with self.subTest(state=state):
+                with self.assertRaises(InvalidOrderError):
+                    PurchaseOrder(
+                        "po-validate-5", "supplier-1", self.lines, state
+                    )
+        # A state that is not a usable string at all is refused the same way
+        # every other text field is, by the base error.
+        for state in cast("list[object]", ["", "   ", 7, None]):
+            with self.subTest(state=state):
+                with self.assertRaises(BusinessError) as raised:
+                    PurchaseOrder(
+                        "po-validate-6", "supplier-1", self.lines, cast("str", state)
+                    )
+                self.assertIs(type(raised.exception), BusinessError)
+        # Both states the domain does produce still construct.
+        for state in sorted(PURCHASE_ORDER_STATES):
+            with self.subTest(state=state):
+                self.assertEqual(
+                    PurchaseOrder(
+                        f"po-validate-{state}", "supplier-1", self.lines, state
+                    ).state,
+                    state,
+                )
+
+    def test_a_receipt_refuses_an_empty_receipt_id_or_order_id(self) -> None:
+        for receipt_id in ("", "  "):
+            with self.subTest(receipt_id=receipt_id):
+                with self.assertRaises(BusinessError) as raised:
+                    Receipt(receipt_id, "po-validate-1", self.lines)
+                self.assertIs(type(raised.exception), BusinessError)
+        with self.assertRaises(BusinessError) as raised:
+            Receipt("receipt-validate-2", "", self.lines)
+        self.assertIs(type(raised.exception), BusinessError)
+
+    def test_a_receipt_refuses_no_lines(self) -> None:
+        # Its movements already exist by the time a receipt is stored, so this
+        # is the one record that must not come back meaningless.
+        with self.assertRaises(InvalidOrderError):
+            Receipt("receipt-validate-3", "po-validate-1", ())
+
+    def test_a_receipt_refuses_a_state_the_domain_does_not_produce(self) -> None:
+        self.assertEqual(RECEIPT_STATES, {"received"})
+        # "open" is the order's own state, never a receipt's.
+        with self.assertRaises(InvalidOrderError):
+            Receipt("receipt-validate-4", "po-validate-1", self.lines, "open")
+        for state in cast("list[object]", ["", "   ", 7, None]):
+            with self.subTest(state=state):
+                with self.assertRaises(BusinessError) as raised:
+                    Receipt(
+                        "receipt-validate-5",
+                        "po-validate-1",
+                        self.lines,
+                        cast("str", state),
+                    )
+                self.assertIs(type(raised.exception), BusinessError)
+        # And the one state a receipt is born with still constructs, with no
+        # argument at all.
+        self.assertEqual(self.receipt.state, "received")
+
+    def test_a_valid_purchasing_record_still_constructs_and_round_trips(self) -> None:
+        # A validation that refused legitimate state would be as much a bug as
+        # the hole it closes, so the whole purchasing path is walked once: the
+        # domain creates the records, a store keeps them, and restore rebuilds
+        # them through the very constructors the rejection cases above refuse.
+        business = Business()
+        item = business.register_item("item-1", "SKU-1", "Widget")
+        business.create_purchase_order(
+            "supplier-1", [(item.item_id, 4)], order_id="po-validate-round"
+        )
+        business.receive_purchase_order(
+            "po-validate-round", "receipt-validate-round"
+        )
+        # Read the records back off the domain, because receiving replaces the
+        # order with a received one; storing the pre-receipt value would be
+        # storing a different, still-open order.
+        order = business.get_purchase_order("po-validate-round")
+        receipt = business.get_receipt("receipt-validate-round")
+
+        store = InMemoryBusinessStore()
+        store.save_item(item)
+        store.save_purchase_order(order)
+        store.save_receipt(receipt)
+        store.save_movements(business.stock_movements.values())
+        records = store.load()
+        store.close()
+
+        self.assertEqual(records.purchase_orders, (order,))
+        self.assertEqual(records.receipts, (receipt,))
+
+        restored = Business()
+        restored.restore(
+            items=records.items,
+            purchase_orders=records.purchase_orders,
+            receipts=records.receipts,
+            stock_movements=records.stock_movements,
+        )
+
+        self.assertEqual(restored.get_purchase_order(order.order_id), order)
+        self.assertEqual(restored.get_receipt(receipt.receipt_id), receipt)
+        self.assertTrue(restored.get_purchase_order(order.order_id).is_received)
+        self.assertEqual(restored.stock_for("item-1"), 4)
+        self.assertEqual(
+            restored.audit_snapshot().to_dict(), business.audit_snapshot().to_dict()
+        )
+
+    def test_a_corrupt_stored_order_fails_the_reload_instead_of_restoring(self) -> None:
+        # Only object.__setattr__ can produce a record that skipped its own
+        # __post_init__, which is exactly what a corrupt database row is.  Before
+        # the constructors validated, PurchaseOrder("", "", ()) constructed
+        # happily and restore put an order with no id into the domain.
+        for field, value in (
+            ("order_id", ""),
+            ("supplier_id", ""),
+            ("lines", ()),
+            ("state", "cancelled"),
+        ):
+            with self.subTest(field=field):
+                corrupt = PurchaseOrder("po-corrupt", "supplier-1", self.lines)
+                object.__setattr__(corrupt, field, value)
+
+                target = Business()
+                with self.assertRaises(BusinessError):
+                    target.restore(purchase_orders=[corrupt])
+
+                self.assertEqual(target.purchase_orders, {})
+
+    def test_a_corrupt_stored_receipt_fails_the_reload_instead_of_restoring(self) -> None:
+        for field, value in (
+            ("receipt_id", ""),
+            ("order_id", ""),
+            ("lines", ()),
+            ("state", "open"),
+        ):
+            with self.subTest(field=field):
+                corrupt = Receipt("receipt-corrupt", "po-corrupt", self.lines)
+                object.__setattr__(corrupt, field, value)
+
+                target = Business()
+                with self.assertRaises(BusinessError):
+                    target.restore(receipts=[corrupt])
+
+                self.assertEqual(target.receipts, {})
+
+    def test_a_corrupt_stored_line_quantity_fails_the_reload(self) -> None:
+        # The other half of the same hole: a stored quantity of zero or a
+        # negative one would move stock by a plausible wrong number on reload.
+        # The whole row is corrupt, as a bad database row would be, so the order
+        # is corrupted too -- the corrupt line alone cannot even be wrapped in
+        # an order, which is the point of the check.
+        for quantity in (0, -3, 1.5):
+            with self.subTest(quantity=quantity):
+                corrupt_order = PurchaseOrder("po-corrupt", "supplier-1", self.lines)
+                corrupt_line = PurchaseOrderLine("item-1", 1)
+                object.__setattr__(corrupt_line, "quantity", quantity)
+                object.__setattr__(corrupt_order, "lines", (corrupt_line,))
+
+                target = Business()
+                with self.assertRaises(InvalidQuantityError):
+                    target.restore(purchase_orders=[corrupt_order])
+
+                self.assertEqual(target.purchase_orders, {})
+
+    def test_a_reloaded_line_is_rebuilt_rather_than_kept_as_it_arrived(self) -> None:
+        # The positive half of the same check: rebuilding a line through its own
+        # constructor must not change a valid one, or the reload would quietly
+        # rewrite stored purchasing on every restart.
+        source = PurchaseOrder("po-rebuild", "supplier-1", self.lines)
+
+        reloaded = PurchaseOrder("po-rebuild", "supplier-1", source.lines)
+
+        self.assertEqual(reloaded, source)
+        self.assertEqual(reloaded.lines, self.lines)
+        self.assertIsInstance(reloaded.lines[0], PurchaseOrderLine)
+
 
 
 if __name__ == "__main__":
