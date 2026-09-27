@@ -23,6 +23,14 @@ of the sale command only; the business state behind it stays in memory unless a
 the item master, the purchasing a receipt's movements came from, sales,
 journals, and stock movements are written through and reloaded on the next
 start.
+
+The *proposal* the peer submitted is a third thing again, and it belongs to the
+protocol rather than to this product: ``ATLAS_ERP_CONNECT_DATABASE_URL`` names
+the protocol's own store, a different variable from the ERP one on purpose, and
+it is read only by the protocol adapter.  See
+:mod:`atlas_erp.proposal_store`; no product domain code in this package reaches
+it.  Unset, the decision stays process-local and everything else behaves exactly
+as it did.
 """
 
 from __future__ import annotations
@@ -47,7 +55,13 @@ from .business import (
     InsufficientStockError,
 )
 from .business_store import BusinessStore, PostgresBusinessStore
-from .protocol import PermissionDeniedError, ProtocolError, ProtocolKernel
+from .protocol import (
+    PermissionDeniedError,
+    ProtocolAdapter,
+    ProtocolError,
+    ProtocolKernel,
+)
+from .proposal_store import PostgresProposalStore, ProposalStore
 from .sale_store import (
     IN_PROGRESS,
     PAYLOAD_CONFLICT,
@@ -62,6 +76,7 @@ PEER_TOKENS_ENV = "ATLAS_ERP_PEER_TOKENS"
 HOST_ENV = "ATLAS_ERP_CONNECT_HOST"
 PORT_ENV = "ATLAS_ERP_CONNECT_PORT"
 DATABASE_ENV = "ATLAS_ERP_DATABASE_URL"
+CONNECT_DATABASE_ENV = "ATLAS_ERP_CONNECT_DATABASE_URL"
 JSON_CONTENT_TYPE = "application/json"
 MANUAL_SALES_CAPABILITY = "sales.manual_sales"
 AUDIT_CAPABILITY = "audit.snapshot"
@@ -485,15 +500,15 @@ class ConnectHandler(BaseHTTPRequestHandler):
         ``rejected`` on purpose: the master did not decide, and a record that
         claims otherwise is worse than one that admits it.
 
-        # ponytail: proposals live in the protocol adapter, which is process-local
-        # and says so.  Two ceilings follow, both real and both recorded rather
-        # than fixed here: a receipt replayed after a restart names a sale whose
-        # proposal no longer exists, because the receipt is the durable record
-        # and the decision is not; and one decided proposal is retained per
-        # connected sale for the life of the process, because deleting the
-        # decision on apply would throw away the only record of why it happened.
-        # Give proposals a durable table before an operator decision can rely on
-        # them, and before the retention is worth bounding.
+        # ponytail: the proposal lives in the protocol adapter, and the adapter is
+        # where a durable store is injected -- so the decision now survives a
+        # restart and a replayed receipt names a proposal that still exists.  The
+        # ceiling that remains is the one the contract names: this row and the
+        # sale it authorised are in two databases, so a crash between the
+        # ``accepted`` write below and the domain write leaves a decision with no
+        # effect.  Reconciling that is idempotency and reconciliation, not a
+        # two-phase commit, and merging the stores into one transaction is not
+        # available to ask for.
         """
 
         customer_id, sale_id, lines = request
@@ -981,7 +996,9 @@ class ConnectServer:
         self.stop()
 
 
-def _fixture() -> tuple[Business, ProtocolKernel]:
+def _fixture(
+    proposal_store: ProposalStore | None = None,
+) -> tuple[Business, ProtocolKernel]:
     """Build the in-memory state the smoke server serves.
 
     The item master price is the price a connected peer must submit, and the
@@ -1000,7 +1017,7 @@ def _fixture() -> tuple[Business, ProtocolKernel]:
         [{"item_id": item.item_id, "quantity": 1, "unit_price_cents": 1250}],
         sale_id="sale-1",
     )
-    return business, ProtocolKernel(business.registry)
+    return business, ProtocolKernel(business.registry, ProtocolAdapter(proposal_store))
 
 
 def _environment_port() -> int:
@@ -1050,6 +1067,28 @@ def _business_store() -> BusinessStore | None:
         raise ValueError(f"{DATABASE_ENV} could not be used") from exc
 
 
+def _proposal_store() -> ProposalStore | None:
+    """Return the protocol's durable proposal store, or None when unset.
+
+    Same blank-means-in-memory rule and the same refusal to report anything but
+    the variable name as the other two stores, on a **new** variable rather than
+    a second meaning for an existing one: ``ATLAS_ERP_DATABASE_URL`` is this
+    product's database and the protocol's store is not this product's database,
+    so one URL cannot be both.  A peer reaches the resulting store with its own
+    credentials, and nothing in this product's domain code can.
+    """
+
+    dsn = os.environ.get(CONNECT_DATABASE_ENV, "")
+    if not dsn.strip():
+        return None
+    try:
+        return PostgresProposalStore(dsn)
+    except Exception as exc:
+        # The driver error can quote the connection string, so only the
+        # variable name is reported.
+        raise ValueError(f"{CONNECT_DATABASE_ENV} could not be used") from exc
+
+
 def _seed_business_store(store: BusinessStore, business: Business) -> None:
     """Write the smoke fixture into an empty store, once, as one unit of work.
 
@@ -1080,6 +1119,7 @@ def _seed_business_store(store: BusinessStore, business: Business) -> None:
 
 def _startup_business(
     store: BusinessStore | None,
+    proposal_store: ProposalStore | None = None,
 ) -> tuple[Business, ProtocolKernel]:
     """Return the domain this process serves and the kernel over it.
 
@@ -1087,13 +1127,16 @@ def _startup_business(
     one, stored state wins: an empty store is seeded from the fixture once, and
     a populated store is restored instead of the fixture, which is what makes a
     restart serve the sales it already acknowledged instead of forgetting them.
+    The proposal store is orthogonal to both: it is where decisions go, and it is
+    handed to the adapter whether the domain came from the fixture or the
+    database.
     """
 
     if store is None:
-        return _fixture()
+        return _fixture(proposal_store)
     records = store.load()
     if not records.items:
-        business, protocol = _fixture()
+        business, protocol = _fixture(proposal_store)
         _seed_business_store(store, business)
         return business, protocol
     business = Business()
@@ -1105,7 +1148,7 @@ def _startup_business(
         journals=records.journals,
         stock_movements=records.stock_movements,
     )
-    return business, ProtocolKernel(business.registry)
+    return business, ProtocolKernel(business.registry, ProtocolAdapter(proposal_store))
 
 
 CONNECTED_PEER_GRANTS: Mapping[str, Mapping[str, str]] = {
@@ -1179,13 +1222,15 @@ def _environment_peer_tokens() -> dict[str, str]:
 
 
 def main() -> int:
+    proposal_store: ProposalStore | None = None
     try:
         peer_tokens = _environment_peer_tokens()
         host = os.environ.get(HOST_ENV, DEFAULT_HOST)
         port = _environment_port()
         store = _database_store()
         business_store = _business_store()
-        business, protocol = _startup_business(business_store)
+        proposal_store = _proposal_store()
+        business, protocol = _startup_business(business_store, proposal_store)
         grant_configured_peers(protocol)
         server = ConnectServer(
             business,
@@ -1202,6 +1247,10 @@ def main() -> int:
 
     mode = "postgres" if store is not None else "in-memory"
     state = "postgres" if business_store is not None else "in-memory"
+    # The banner names the two stores whose mode an operator of *this product*
+    # configures.  The proposal store is a third thing on a third database and is
+    # left out on purpose: it is the protocol's, and no product setting chooses
+    # where a decision is kept.
     print(
         f"Atlas ERP Connect listening on {server.url} "
         f"(sale receipts: {mode}, business state: {state})",
@@ -1213,6 +1262,8 @@ def main() -> int:
         pass
     finally:
         server.close()
+        if proposal_store is not None:
+            proposal_store.close()
     return 0
 
 
@@ -1223,6 +1274,7 @@ if __name__ == "__main__":
 __all__ = [
     "AUDIT_CAPABILITY",
     "CONNECTED_PEER_GRANTS",
+    "CONNECT_DATABASE_ENV",
     "ConnectHandler",
     "ConnectServer",
     "DATABASE_ENV",

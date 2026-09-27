@@ -212,11 +212,14 @@ ORDER BY po.po_number;
 ## Not in scope
 
 No `atlas_erp` production schema, no migration tool, no Docker or dependency
-changes, and no code that reads these tables. The application owns two stores
-of its own, neither of them these example tables and neither wired to `db/`:
-`connected_sale_commands`, created by `atlas_erp.sale_store`, and the ten
-tables behind `atlas_erp.business_store` — the item master, sales, journal
-entries, and stock movements, each with its lines. Both use
-`CREATE TABLE IF NOT EXISTS`; neither is a migration system, so a table created
+changes, and no code that reads these tables. The application owns three stores
+of its own, none of them these example tables and none wired to `db/`:
+`connected_sale_commands`, created by `atlas_erp.sale_store`; the ten tables
+behind `atlas_erp.business_store` — the item master, sales, journal entries, and
+stock movements, each with its lines; and `connect_proposals`, created by
+`atlas_erp.proposal_store` for the protocol module's own durable proposal record,
+which lives in a **third** database rather than in either product's. The first
+two share this product's database; the third does not. All three use
+`CREATE TABLE IF NOT EXISTS`; none is a migration system, so a table created
 before a later constraint existed never gains it. Pointing the ERP business
 state at `db/` is a later decision, not part of this dataset.

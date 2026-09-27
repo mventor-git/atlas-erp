@@ -24,6 +24,7 @@ import time
 from collections.abc import Mapping
 from http.client import HTTPConnection
 from pathlib import Path
+from typing import cast
 
 ERP_ROOT = Path(__file__).resolve().parents[1]
 ECOM_ROOT = ERP_ROOT.parent / "atlas-ecom"
@@ -43,7 +44,11 @@ HOST_ENV = "ATLAS_ERP_CONNECT_HOST"
 PORT_ENV = "ATLAS_ERP_CONNECT_PORT"
 ALLOW_WRITE_ENV = "ATLAS_ERP_ALLOW_WRITE"
 ECOM_DATABASE_ENV = "ATLAS_ECOM_DATABASE_URL"
-HEALTH_TIMEOUT_SECONDS = 10.0
+# The server binds its socket only after every configured store has opened and
+# created its schema, so this budget covers the protocol store's DDL as well as
+# the two product ones.  Ten seconds was measured against two stores and was
+# tight enough to fail a cold run; thirty costs nothing when startup is fast.
+HEALTH_TIMEOUT_SECONDS = 30.0
 CLIENT_TIMEOUT_SECONDS = 30.0
 STOP_TIMEOUT_SECONDS = 5.0
 
@@ -96,13 +101,35 @@ def _stop_process(process: subprocess.Popen[str]) -> tuple[str, str]:
         return process.communicate(timeout=STOP_TIMEOUT_SECONDS)
 
 
+def _client_result(stdout: str) -> dict[str, object] | None:
+    """Return the JSON object a client printed last, or None if it printed none.
+
+    Every client ends with one JSON line describing what it proved.  It is read
+    back rather than only printed so a caller can assert on a real ``sale_id``
+    or cursor instead of re-deriving it, and the parse is of the client's own
+    output and nothing else.
+    """
+
+    for line in reversed(stdout.splitlines()):
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return cast("dict[str, object]", payload)
+    return None
+
+
 def _run_client(
     script: Path,
     url: str,
     token: str,
     *,
     extra_env: Mapping[str, str] | None = None,
-) -> int:
+) -> tuple[int, dict[str, object] | None]:
     if not script.is_file():
         raise FileNotFoundError(f"Ecom client not found: {script}")
 
@@ -125,10 +152,17 @@ def _run_client(
         print(result.stdout, end="")
     if result.stderr:
         print(result.stderr, end="", file=sys.stderr)
-    return result.returncode
+    return result.returncode, _client_result(result.stdout)
 
 
-def run_smoke() -> int:
+def run_smoke() -> dict[str, dict[str, object]]:
+    """Run every client and return each one's result keyed by client name.
+
+    The results are what the smoke proved, so they are returned as well as
+    printed: a caller that has to show a reader which sale id and which audit
+    cursor were involved should quote the client rather than guess.
+    """
+
     host = "127.0.0.1"
     port = _free_loopback_port()
     token = secrets.token_urlsafe(32)
@@ -167,16 +201,18 @@ def run_smoke() -> int:
             (ECOM_CHECKOUT_CLIENT, {ALLOW_WRITE_ENV: "1"}, ecom_database == ""),
             (ECOM_ORDER_CLIENT, {ALLOW_WRITE_ENV: "1"}, False),
         )
+        results: dict[str, dict[str, object]] = {}
         for script, extra_env, skip_without_database in clients:
             if skip_without_database:
                 print(f"skipping {script.name}: {ECOM_DATABASE_ENV} is not set")
                 continue
-            return_code = _run_client(script, url, token, extra_env=extra_env)
+            return_code, payload = _run_client(script, url, token, extra_env=extra_env)
             if return_code != 0:
                 raise RuntimeError(
                     f"Ecom client {script.name} exited with status {return_code}"
                 )
-        return 0
+            results[script.stem] = payload or {}
+        return results
     finally:
         if process is not None:
             _stop_process(process)
@@ -184,10 +220,11 @@ def run_smoke() -> int:
 
 def main() -> int:
     try:
-        return run_smoke()
+        run_smoke()
     except Exception as exc:
         print(f"cross-process smoke failed: {exc}", file=sys.stderr)
         return 1
+    return 0
 
 
 if __name__ == "__main__":

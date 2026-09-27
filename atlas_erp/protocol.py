@@ -1,19 +1,30 @@
 """Small Atlas Connect protocol kernel.
 
 This module contains the protocol semantics needed by the first executable
-slice.  The adapter is intentionally process-local and is a protocol/test
-fixture, not production persistence.
+slice.  The adapter is a protocol/test fixture: its cursors, deltas, and inbox
+are process-local and are not production persistence.  Its *proposals* are the
+one thing it can hand to a durable store, because a decision is a record: pass a
+:class:`~atlas_erp.proposal_store.ProposalStore` to the constructor and the
+decision survives a restart, leave it out and it does not.  Only this module
+reaches that store -- product domain code has no path to it at all.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from secrets import token_urlsafe
 from typing import cast
 from uuid import uuid4
 
+from .proposal_store import (
+    DECIDED_STATES,
+    InMemoryProposalStore,
+    Proposal,
+    ProposalStore,
+    ProposalStoreError,
+)
 from .registry import DEFAULT_CONNECT_VERSION, Registry
 
 
@@ -172,26 +183,17 @@ class Delta:
     cursor: str
 
 
-@dataclass(frozen=True)
-class Proposal:
-    """The state and reason of a capability proposal."""
+class ProtocolAdapter:
+    """Protocol/test adapter: process-local, with proposals in a store.
 
-    proposal_id: str
-    capability: str
-    payload: object
-    state: str
-    reason: str | None
-
-
-class InMemoryProtocolAdapter:
-    """Protocol/test adapter with process-local state only.
-
-    This adapter deliberately does not claim durability and is not suitable for
-    production persistence.  It provides the small synchronization, inbox, and
-    proposal primitives needed to run conformance tests.
+    The cursors, deltas, and inbox below are process-local and do not claim
+    durability.  The proposals are the exception, because a decision is a record
+    rather than a position: a :class:`~atlas_erp.proposal_store.ProposalStore`
+    passed here owns them, and the in-memory store is the default so a caller with
+    no database configured behaves exactly as before.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, proposal_store: ProposalStore | None = None) -> None:
         self._state: dict[str, object] = {}
         self._latest_cursors: dict[str, str] = {}
         self._cursor_positions: dict[str, tuple[str, int]] = {}
@@ -199,7 +201,9 @@ class InMemoryProtocolAdapter:
         self._deltas: dict[str, list[tuple[int, Delta]]] = {}
         self._published_event_ids: set[str] = set()
         self._inbox: set[str] = set()
-        self._proposals: dict[str, Proposal] = {}
+        self._proposal_store: ProposalStore = (
+            proposal_store if proposal_store is not None else InMemoryProposalStore()
+        )
 
     @property
     def inbox(self) -> frozenset[str]:
@@ -207,7 +211,7 @@ class InMemoryProtocolAdapter:
 
     @property
     def proposals(self) -> Mapping[str, Proposal]:
-        return dict(self._proposals)
+        return self._proposal_store.all()
 
     def _new_cursor(self, capability: str, position: int) -> str:
         cursor = token_urlsafe(18)
@@ -289,42 +293,41 @@ class InMemoryProtocolAdapter:
         capability: str,
         payload: object,
         proposal_id: str | None = None,
+        *,
+        peer_id: str,
     ) -> Proposal:
+        """Record one peer's request that the master decide it.
+
+        ``peer_id`` is required rather than defaulted: a proposal is somebody's
+        intent, it is the column the store's row policy confines to that peer,
+        and a proposal that named nobody would be a row no peer's credential
+        could ever see.
+        """
+
         capability = _text(capability, "capability")
-        proposal_id = proposal_id or uuid4().hex
-        proposal_id = _text(proposal_id, "proposal_id")
-        if proposal_id in self._proposals:
-            raise ProposalError(f"proposal already exists: {proposal_id}")
-        proposal = Proposal(
-            proposal_id,
-            capability,
-            deepcopy(payload),
-            "pending",
-            None,
-        )
-        self._proposals[proposal_id] = proposal
-        return proposal
+        proposal_id = _text(proposal_id or uuid4().hex, "proposal_id")
+        peer_id = _text(peer_id, "peer_id")
+        try:
+            return self._proposal_store.create(proposal_id, peer_id, capability, payload)
+        except ProposalStoreError as exc:
+            raise ProposalError(str(exc)) from exc
 
     def get_proposal(self, proposal_id: str) -> Proposal:
         try:
-            return self._proposals[proposal_id]
-        except KeyError as exc:
-            raise ProposalError(f"unknown proposal: {proposal_id}") from exc
+            return self._proposal_store.get(proposal_id)
+        except ProposalStoreError as exc:
+            raise ProposalError(str(exc)) from exc
 
     def transition_proposal(
         self, proposal_id: str, state: str, reason: str
     ) -> Proposal:
-        if state not in {"accepted", "rejected"}:
+        if state not in DECIDED_STATES:
             raise ProposalError("proposal can only transition to accepted or rejected")
         reason = _text(reason, "proposal reason")
-        current = self.get_proposal(proposal_id)
-        if current.state != "pending":
-            raise ProposalError(
-                f"proposal is already {current.state}: {proposal_id}"
-            )
-        updated = replace(current, state=state, reason=reason)
-        self._proposals[proposal_id] = updated
-        return updated
+        try:
+            return self._proposal_store.transition(proposal_id, state, reason)
+        except ProposalStoreError as exc:
+            raise ProposalError(str(exc)) from exc
 
 
 class ProtocolKernel:
@@ -333,13 +336,13 @@ class ProtocolKernel:
     def __init__(
         self,
         registry: Registry | None = None,
-        adapter: InMemoryProtocolAdapter | None = None,
+        adapter: ProtocolAdapter | None = None,
         *,
         app_id: str | None = None,
         connect_version: str | None = None,
     ) -> None:
         self.registry = registry if registry is not None else Registry()
-        self.adapter = adapter if adapter is not None else InMemoryProtocolAdapter()
+        self.adapter = adapter if adapter is not None else ProtocolAdapter()
         self.app_id = app_id or self.registry.app_id
         self.connect_version = connect_version or self.registry.connect_version
         self._peer_manifest: dict[str, object] | None = None
@@ -516,9 +519,13 @@ class ProtocolKernel:
         wire gave it cannot come apart.  That also means a capability which does
         not advertise ``propose`` refuses a proposal from anyone, master
         included: there is nothing there to decide.
+
+        The peer is named on the record it creates, not only on the grant that
+        let it ask: the proposal is the peer's own record, and the store's row
+        policy is written against that column.
         """
         self.authorize(peer_id, capability, "propose")
-        return self.adapter.create_proposal(capability, payload)
+        return self.adapter.create_proposal(capability, payload, peer_id=peer_id)
 
     def resolve_proposal(
         self,
@@ -539,4 +546,9 @@ class ProtocolKernel:
 
 # A descriptive alias for callers that prefer the product-specific name.
 ConnectProtocol = ProtocolKernel
-InMemoryAdapter = InMemoryProtocolAdapter
+# The name this adapter had while it held only process-local state.  It is kept
+# because it is the published name, and it now means "an adapter whose proposals
+# are in the default in-memory store" -- so a caller that wants a durable
+# decision names a :class:`~atlas_erp.proposal_store.ProposalStore` instead.
+InMemoryAdapter = ProtocolAdapter
+InMemoryProtocolAdapter = ProtocolAdapter
