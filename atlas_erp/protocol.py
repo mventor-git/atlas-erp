@@ -20,13 +20,17 @@ from .registry import DEFAULT_CONNECT_VERSION, Registry
 CONNECT_VERSION = DEFAULT_CONNECT_VERSION
 # The role vocabulary and what each role may do directly.  This table is the
 # only statement of both, so every other question about a role -- which names
-# exist, which may read, who may write -- is read from it.  Proposing is a
-# separate flow, not a write, so a proposer reads the capability it may not
-# change.
+# exist, which may read, who may write, who may ask the master to decide -- is
+# read from it.  Proposing is a separate flow, not a write, so a proposer reads
+# the capability it may not change and answers ``propose`` where the master
+# answers ``write``.  ``master`` holds ``propose`` too, and for the transport's
+# sake rather than the domain's: a transport names one permission per route and
+# asks every caller the same question, so a master-issued request has to answer
+# the same ``propose`` question a peer's does before the master applies it.
 _ROLE_PERMISSIONS: Mapping[str, frozenset[str]] = {
-    "master": frozenset({"read", "write"}),
+    "master": frozenset({"read", "write", "propose"}),
     "reader": frozenset({"read"}),
-    "proposer": frozenset({"read"}),
+    "proposer": frozenset({"read", "propose"}),
 }
 # The internal reader gate is a projection of the table above rather than a
 # second statement of it, so the public ``authorize`` seam and the gate cannot
@@ -505,7 +509,15 @@ class ProtocolKernel:
         *,
         peer_id: str,
     ) -> Proposal:
-        self._require_role(capability, peer_id, "proposer")
+        """Record a peer's request that the master decide a proposed change.
+
+        This asks the same public question a transport asks, rather than a second
+        role comparison, so the flow a peer reaches in process and the answer the
+        wire gave it cannot come apart.  That also means a capability which does
+        not advertise ``propose`` refuses a proposal from anyone, master
+        included: there is nothing there to decide.
+        """
+        self.authorize(peer_id, capability, "propose")
         return self.adapter.create_proposal(capability, payload)
 
     def resolve_proposal(

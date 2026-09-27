@@ -32,6 +32,13 @@ from atlas_erp.sale_store import DEFAULT_LEASE_SECONDS
 
 _MISSING = object()
 _RAW = object()
+# The credential is scoped to a peer, and these cases drive the routes as the app
+# that serves them.  That is not a way around authority: ``atlas-erp`` is the
+# master of every capability it serves and the only principal
+# ``ProtocolKernel.authorize`` can permit to write one, so a peer credential gets
+# 403 on the sale route instead.  The peer cases live in
+# tests/test_connect_authority.py.
+PEER_TOKENS = {"atlas-erp": "test-token"}
 # The rejected-request race is rare, so the wire test repeats it; the drain
 # itself is pinned directly by RejectedRequestBodyTests.
 REPEATED_REJECTIONS = 25
@@ -61,7 +68,7 @@ class ConnectHandlerTests(unittest.TestCase):
         self.server = ConnectServer(
             self.business,
             self.protocol,
-            "test-token",
+            PEER_TOKENS,
             port=0,
         )
         self.server.start()
@@ -122,7 +129,7 @@ class ConnectHandlerTests(unittest.TestCase):
         server = ConnectServer(
             self.business,
             self.protocol,
-            "test-token",
+            PEER_TOKENS,
             port=0,
             sale_store=store,
             business_store=business_store,
@@ -254,7 +261,7 @@ class ConnectHandlerTests(unittest.TestCase):
             ConnectServer(
                 self.business,
                 self.protocol,
-                "test-token",
+                PEER_TOKENS,
                 host="0.0.0.0",
                 port=0,
             )

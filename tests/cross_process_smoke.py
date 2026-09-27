@@ -30,7 +30,15 @@ ECOM_ROOT = ERP_ROOT.parent / "atlas-ecom"
 ECOM_CLIENT = ECOM_ROOT / "src" / "connect-smoke.ts"
 ECOM_CHECKOUT_CLIENT = ECOM_ROOT / "src" / "connected-checkout-smoke.ts"
 ECOM_ORDER_CLIENT = ECOM_ROOT / "src" / "connected-order-smoke.ts"
-TOKEN_ENV = "ATLAS_ERP_CONNECT_TOKEN"
+# The transport takes one token per peer app_id; the Ecom clients still take a
+# single token under the retired name.  The harness bridges the two, which is
+# the whole of the credential rename's blast radius: until the sibling reads
+# ATLAS_ERP_PEER_TOKENS itself, this file is the only place that knows both
+# names, and the Ecom clients keep working only because the same token value is
+# written into each.
+PEER_TOKENS_ENV = "ATLAS_ERP_PEER_TOKENS"
+ECOM_CLIENT_TOKEN_ENV = "ATLAS_ERP_CONNECT_TOKEN"
+PEER_APP_ID = "atlas-ecom"
 HOST_ENV = "ATLAS_ERP_CONNECT_HOST"
 PORT_ENV = "ATLAS_ERP_CONNECT_PORT"
 ALLOW_WRITE_ENV = "ATLAS_ERP_ALLOW_WRITE"
@@ -100,7 +108,7 @@ def _run_client(
 
     client_env = os.environ.copy()
     client_env["ATLAS_ERP_URL"] = url
-    client_env[TOKEN_ENV] = token
+    client_env[ECOM_CLIENT_TOKEN_ENV] = token
     client_env.update(extra_env or {})
     result = subprocess.run(
         ["node", "--experimental-strip-types", script.relative_to(ECOM_ROOT).as_posix()],
@@ -127,7 +135,7 @@ def run_smoke() -> int:
     server_env = os.environ.copy()
     server_env.update(
         {
-            TOKEN_ENV: token,
+            PEER_TOKENS_ENV: json.dumps({PEER_APP_ID: token}),
             HOST_ENV: host,
             PORT_ENV: str(port),
         }

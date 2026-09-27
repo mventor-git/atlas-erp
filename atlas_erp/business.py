@@ -468,6 +468,19 @@ _BUSINESS_MODULES = (
 )
 
 
+def _advertised(permissions: frozenset[str]) -> set[str]:
+    """Widen a capability's own permissions into what its manifest advertises.
+
+    A capability advertises ``propose`` exactly where it advertises ``write``,
+    because a proposal is a request for the master to change the capability: a
+    read-only projection has nothing for the master to decide, and advertising
+    there would promise a grant no flow could honour.  Derived from the row
+    rather than written into it, so the two cannot disagree about which
+    capabilities are proposable.
+    """
+    return set(permissions) | ({"propose"} if "write" in permissions else set())
+
+
 def register_business_capabilities(registry: Registry) -> Registry:
     """Register the capabilities exercised by :class:`Business`.
 
@@ -489,7 +502,7 @@ def register_business_capabilities(registry: Registry) -> Registry:
             cluster_name,
             plugin_name,
             module_name,
-            {capability: set(permissions)},
+            {capability: _advertised(permissions)},
         )
     return registry
 

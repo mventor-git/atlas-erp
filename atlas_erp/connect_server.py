@@ -5,6 +5,17 @@ production security boundary.  Business and protocol state remain
 process-local and are supplied by the caller.  The server only ever binds a
 loopback address, and every connect route also refuses a non-loopback peer.
 
+Authority is the protocol module's decision, not this file's: a guarded route
+names the capability and the permission it exercises and the module answers
+whether the peer that presented the request may.  For that question to have an
+answer the credential has to name a peer, so the transport is configured with
+one token per peer ``app_id`` in ``ATLAS_ERP_PEER_TOKENS`` -- a JSON object
+mapping ``app_id`` to that peer's token, for example
+``{"atlas-ecom": "<token>"}``.  One variable carries one peer or ten, and there
+is no single-peer form: an alias for "the one peer" would keep the
+identity-less configuration alive, which is the one thing a peer-scoped
+credential exists to remove.
+
 A connected sale can be made idempotent by ``sale_id`` by injecting a
 :class:`~atlas_erp.sale_store.SaleCommandStore`.  That store holds the receipt
 of the sale command only; the business state behind it stays in memory unless a
@@ -36,7 +47,7 @@ from .business import (
     InsufficientStockError,
 )
 from .business_store import BusinessStore, PostgresBusinessStore
-from .protocol import ProtocolKernel
+from .protocol import PermissionDeniedError, ProtocolError, ProtocolKernel
 from .sale_store import (
     IN_PROGRESS,
     PAYLOAD_CONFLICT,
@@ -47,12 +58,13 @@ from .sale_store import (
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4310
-TOKEN_ENV = "ATLAS_ERP_CONNECT_TOKEN"
+PEER_TOKENS_ENV = "ATLAS_ERP_PEER_TOKENS"
 HOST_ENV = "ATLAS_ERP_CONNECT_HOST"
 PORT_ENV = "ATLAS_ERP_CONNECT_PORT"
 DATABASE_ENV = "ATLAS_ERP_DATABASE_URL"
 JSON_CONTENT_TYPE = "application/json"
 MANUAL_SALES_CAPABILITY = "sales.manual_sales"
+AUDIT_CAPABILITY = "audit.snapshot"
 MAX_BODY_BYTES = 64 * 1024
 # A rejected body is drained up to this size before the connection is closed.
 DRAIN_LIMIT_BYTES = 1024 * 1024
@@ -62,6 +74,25 @@ _ROUTE_METHODS = {
     "/connect/manifest": "GET",
     "/connect/audit": "GET",
     "/connect/sales": "POST",
+}
+# The capability and permission each guarded route exercises.  This is the only
+# statement the transport makes about a route, and it is a statement about the
+# route rather than about the peer: which role may do what belongs to the module
+# alone, so a row here is a question, not an answer.  It is a table rather than an
+# argument at each call site so that a new guarded route without a row is a test
+# failure instead of an unauthenticated answer.
+#
+# The sale row asks about ``propose`` and not ``write``, which is the whole point
+# of the connected sale surviving enforcement.  ``write`` is reachable only by the
+# master of the capability, and the master of a served capability is the app
+# serving it (SPEC.md, G2), so a ``write`` row would answer 403 to every peer and
+# there would be no connected checkout at all.  ``propose`` is the permission that
+# lets a peer ask the master to decide, and the decision is what authorises the
+# write: the domain write below still runs as the master and still runs only
+# because the master resolved the proposal as accepted.
+ROUTE_AUTHORITY: Mapping[str, tuple[str, str]] = {
+    "/connect/sales": (MANUAL_SALES_CAPABILITY, "propose"),
+    "/connect/audit": (AUDIT_CAPABILITY, "read"),
 }
 
 
@@ -174,6 +205,31 @@ def _normalise_port(port: int) -> int:
     return port
 
 
+def _peer_tokens(value: object) -> dict[str, str]:
+    """Return the peer-scoped credentials, refusing one that cannot name a peer.
+
+    A credential map is only useful if it identifies who presented it, so the
+    cases that would blur that are startup failures rather than warnings: no
+    peers at all serves nobody, a blank ``app_id`` or token is not a peer, and
+    one token shared by two peers makes the answer to "which peer is this?"
+    depend on iteration order.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError("peer tokens must map a peer app_id to its token")
+    tokens: dict[str, str] = {}
+    for peer_id, token in value.items():
+        if not isinstance(peer_id, str) or not peer_id.strip():
+            raise ValueError("peer token app_id must be a non-empty string")
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError(f"connect token for {peer_id} must not be empty")
+        if token in tokens.values():
+            raise ValueError(f"one token cannot identify two peers: {peer_id}")
+        tokens[peer_id.strip()] = token
+    if not tokens:
+        raise ValueError("at least one peer token must be configured")
+    return tokens
+
+
 def _is_loopback(address: str) -> bool:
     """Return True for a loopback peer, including IPv4-mapped IPv6 peers."""
 
@@ -232,13 +288,13 @@ class _ConnectHTTPServer(HTTPServer):
         handler: type[BaseHTTPRequestHandler],
         business: Business,
         protocol: ProtocolKernel,
-        token: str,
+        peer_tokens: Mapping[str, str],
         sale_store: SaleCommandStore | None,
         business_store: BusinessStore | None,
     ) -> None:
         self.business = business
         self.protocol = protocol
-        self.token = token
+        self.peer_tokens = peer_tokens
         self.sale_store = sale_store
         self.business_store = business_store
         super().__init__(server_address, handler)
@@ -247,10 +303,22 @@ class _ConnectHTTPServer(HTTPServer):
 class ConnectHandler(BaseHTTPRequestHandler):
     """HTTP handler for the Connect read profile and one guarded sale write.
 
-    The sale write is deliberately thin: it validates the request, checks every
+    Every connect route resolves the presented credential to a peer ``app_id``
+    first, because a grant is held by an ``app_id`` and a request that names
+    nobody cannot be held to one.  The two guarded routes then ask the protocol
+    module whether that peer may exercise the capability they act on; this class
+    never decides authority itself.
+
+    A peer never writes.  The sale route asks the ``propose`` permission, and
+    what it then does is submit the peer's intent as a proposal, have the master
+    -- the only principal ``resolve_proposal`` permits -- decide it, and apply it
+    as the master when the decision is acceptance.  Who accepts, and when, is
+    policy this transport does not have yet; see ``_propose_and_apply``.
+
+    The write itself is deliberately thin: it validates the request, checks every
     submitted unit price against the local item master, and then calls the same
     :class:`~atlas_erp.business.Business` manual-sale path as the local console
-    would, so stock and journal invariants still hold.  It     never retries.
+    would, so stock and journal invariants still hold.  It never retries.
 
     When a sale store is injected, ``sale_id`` becomes a durable idempotency
     key: an identical retry replays the stored receipt without calling the
@@ -288,7 +356,11 @@ class ConnectHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/connect/manifest":
-            if not self._authenticated():
+            # Identity only, deliberately: see ManifestAndHealthTests in
+            # tests/test_connect_authority.py.  A peer has to be able to read the
+            # manifest to decide whether to pair, and pairing is what grants
+            # authority, so a grant-gated manifest would make pairing impossible.
+            if self._authenticated_peer() is None:
                 self._unauthorized()
                 return
             self._send_json(
@@ -298,15 +370,14 @@ class ConnectHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/connect/audit":
-            if not self._authenticated():
-                self._unauthorized()
+            if self._authorised_peer(path) is None:
                 return
             try:
                 data = self.server.business.audit_snapshot().to_dict()
                 payload = {
                     "app_id": self.server.protocol.app_id,
                     "type": "snapshot",
-                    "capability": "audit.snapshot",
+                    "capability": AUDIT_CAPABILITY,
                     "connect_version": self.server.protocol.connect_version,
                     "cursor": snapshot_cursor(data),
                     "data": data,
@@ -325,12 +396,12 @@ class ConnectHandler(BaseHTTPRequestHandler):
         if self._path() != "/connect/sales":
             self._method_not_allowed()
             return
-        if not self._authenticated():
-            self._unauthorized()
+        peer_id = self._authorised_peer("/connect/sales")
+        if peer_id is None:
             return
         try:
             request = _sale_request(self._read_json_body())
-            payload = self._post_connected_sale(request)
+            payload = self._post_connected_sale(request, peer_id)
         except _RequestError as error:
             if error.close:
                 self.close_connection = True
@@ -343,7 +414,7 @@ class ConnectHandler(BaseHTTPRequestHandler):
         self._send_json(201, payload)
 
     def _post_connected_sale(
-        self, request: tuple[str, str, list[dict[str, object]]]
+        self, request: tuple[str, str, list[dict[str, object]]], peer_id: str
     ) -> dict[str, object]:
         """Post one guarded manual sale, or replay an earlier identical one.
 
@@ -353,7 +424,7 @@ class ConnectHandler(BaseHTTPRequestHandler):
 
         store = self.server.sale_store
         if store is None:
-            return self._create_manual_sale(request)
+            return self._propose_and_apply(peer_id, request)
 
         _, sale_id, _ = request
         reservation = store.reserve(sale_id, sale_command_hash(request))
@@ -374,7 +445,10 @@ class ConnectHandler(BaseHTTPRequestHandler):
                 headers=_retry_after(reservation.retry_after_seconds),
             )
         try:
-            payload = self._create_manual_sale(request)
+            # The proposal is inside the reservation and not before it, so a
+            # replayed key answers from the receipt without asking the master to
+            # decide the same intent twice.
+            payload = self._propose_and_apply(peer_id, request)
             # The durable write comes before the receipt on purpose: a store
             # that cannot record the sale aborts the key below, so the peer is
             # never handed a 201 for a sale no restart would still know about.
@@ -384,6 +458,66 @@ class ConnectHandler(BaseHTTPRequestHandler):
             store.abort(sale_id)
             raise
         store.complete(sale_id, payload)
+        return payload
+
+    def _propose_and_apply(
+        self, peer_id: str, request: tuple[str, str, list[dict[str, object]]]
+    ) -> dict[str, object]:
+        """Turn one peer's request into a proposal the master decides, then apply it.
+
+        This is the only route by which a peer's intent reaches the domain, and
+        it is deliberately not a write: the peer holds ``propose`` and no more,
+        the master is the only principal ``resolve_proposal`` permits, and the
+        write below happens as the master and only because the master accepted.
+        A peer that wanted a sale without the master's validation cannot express
+        that, because the validation *is* the decision.
+
+        Who accepts is **policy, not mechanism, and it is open**: the master
+        decides here, immediately and deterministically, because the only
+        decision available today is the domain's own -- insufficient stock, price
+        mismatch, duplicate sale -- and an operator in the loop would need a
+        decision surface this transport does not have.  What this flow does
+        provide is the place one would live: a proposal is a pending record with
+        a payload, a proposer, and a master that has not yet answered, which is
+        the honest shape of an unanswered request.
+
+        An unexpected failure leaves the proposal ``pending`` rather than
+        ``rejected`` on purpose: the master did not decide, and a record that
+        claims otherwise is worse than one that admits it.
+
+        # ponytail: proposals live in the protocol adapter, which is process-local
+        # and says so.  Two ceilings follow, both real and both recorded rather
+        # than fixed here: a receipt replayed after a restart names a sale whose
+        # proposal no longer exists, because the receipt is the durable record
+        # and the decision is not; and one decided proposal is retained per
+        # connected sale for the life of the process, because deleting the
+        # decision on apply would throw away the only record of why it happened.
+        # Give proposals a durable table before an operator decision can rely on
+        # them, and before the retention is worth bounding.
+        """
+
+        customer_id, sale_id, lines = request
+        proposal = self.server.protocol.submit_proposal(
+            MANUAL_SALES_CAPABILITY,
+            {
+                "customer_id": customer_id,
+                "sale_id": sale_id,
+                "lines": [dict(line) for line in lines],
+            },
+            peer_id=peer_id,
+        )
+        try:
+            payload = self._create_manual_sale(request)
+        except _RequestError as error:
+            # The domain's own refusal is the decision, and its code is the
+            # reason: a peer is told the same thing either way.
+            self.server.protocol.resolve_proposal(
+                proposal.proposal_id, "rejected", error.code
+            )
+            raise
+        self.server.protocol.resolve_proposal(
+            proposal.proposal_id, "accepted", f"posted {payload['sale_id']}"
+        )
         return payload
 
     def _write_business_state(self, sale_id: str) -> None:
@@ -564,16 +698,54 @@ class ConnectHandler(BaseHTTPRequestHandler):
         self._send_json(403, {"error": "forbidden"})
         return False
 
-    def _authenticated(self) -> bool:
+    def _authenticated_peer(self) -> str | None:
+        """Return the ``app_id`` the presented credential belongs to, or None.
+
+        The credential is scoped to a peer precisely so the module can be asked
+        about *someone*: one opaque token names no peer, so no grant could be
+        consulted about whoever presented it.  Every configured credential is
+        compared and none short-circuits, so the number of peers is not visible
+        in how long the answer takes.
+        """
         header = self.headers.get("Authorization")
         if header is None:
-            return False
+            return None
         parts = header.split()
         if len(parts) != 2 or parts[0].lower() != "bearer":
-            return False
-        return hmac.compare_digest(
-            parts[1].encode("utf-8"), self.server.token.encode("utf-8")
-        )
+            return None
+        presented = parts[1].encode("utf-8")
+        peer_id: str | None = None
+        for candidate, token in self.server.peer_tokens.items():
+            if hmac.compare_digest(presented, token.encode("utf-8")):
+                peer_id = candidate
+        return peer_id
+
+    def _authorised_peer(self, path: str) -> str | None:
+        """Return the peer id when the module permits it to use this route.
+
+        ``ROUTE_AUTHORITY`` names the capability and permission the route
+        exercises and the module answers, so nothing here restates which role
+        may do what.  None means the request has already been answered: 401 for
+        a credential this transport does not know, 403 for a known peer holding
+        no grant that permits it.
+
+        Both refusals answer before the body is read, which is the same shape as
+        the rejected-content-type case ``_drain_body`` exists for.  A refused
+        ``POST /connect/sales`` was measured delivering its 403 on 40 of 40
+        sends, so nothing is drained here; if a change makes the connection
+        close differently, that measurement is the thing to re-take.
+        """
+        peer_id = self._authenticated_peer()
+        if peer_id is None:
+            self._unauthorized()
+            return None
+        capability, permission = ROUTE_AUTHORITY[path]
+        try:
+            self.server.protocol.authorize(peer_id, capability, permission)
+        except PermissionDeniedError:
+            self._forbidden()
+            return None
+        return peer_id
 
     def _method_not_allowed(self) -> None:
         allowed = _ROUTE_METHODS.get(self._path())
@@ -592,6 +764,12 @@ class ConnectHandler(BaseHTTPRequestHandler):
             {"error": "unauthorized"},
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    def _forbidden(self) -> None:
+        # 403 rather than 401: the credential was recognised, so the peer is
+        # known and retrying with the same one cannot help.  Only a grant changes
+        # this answer, and a peer cannot mint one.
+        self._send_json(403, {"error": "forbidden"})
 
     def _not_found(self) -> None:
         self._send_json(404, {"error": "not found"})
@@ -635,7 +813,7 @@ def _make_server(
     port: int,
     business: Business,
     protocol: ProtocolKernel,
-    token: str,
+    peer_tokens: Mapping[str, str],
     sale_store: SaleCommandStore | None,
     business_store: BusinessStore | None,
 ) -> _ConnectHTTPServer:
@@ -651,7 +829,7 @@ def _make_server(
         ConnectHandler,
         business,
         protocol,
-        token,
+        peer_tokens,
         sale_store,
         business_store,
     )
@@ -659,6 +837,11 @@ def _make_server(
 
 class ConnectServer:
     """A one-shot HTTP server around injected business and protocol objects.
+
+    ``peer_tokens`` maps a peer ``app_id`` to that peer's credential, and is the
+    only way a request is identified: the handler asks the protocol module about
+    the peer the presented token names.  There is no single-token form, because a
+    token that names nobody is a token no grant can be held against.
 
     ``sale_store`` is optional.  Injecting one makes ``POST /connect/sales``
     idempotent by ``sale_id`` for the lifetime of that store; leaving it out
@@ -674,16 +857,15 @@ class ConnectServer:
         self,
         business: Business,
         protocol: ProtocolKernel,
-        token: str,
+        peer_tokens: Mapping[str, str],
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
         sale_store: SaleCommandStore | None = None,
         business_store: BusinessStore | None = None,
     ) -> None:
-        if not isinstance(token, str) or not token.strip():
-            raise ValueError("connect token must not be empty")
         self.business = business
         self.protocol = protocol
+        self.peer_tokens = _peer_tokens(peer_tokens)
         self.sale_store = sale_store
         self.business_store = business_store
         self._host = _normalise_host(host)
@@ -693,7 +875,7 @@ class ConnectServer:
             self._port,
             business,
             protocol,
-            token,
+            self.peer_tokens,
             sale_store,
             business_store,
         )
@@ -926,28 +1108,95 @@ def _startup_business(
     return business, ProtocolKernel(business.registry)
 
 
-def main() -> int:
-    token = os.environ.get(TOKEN_ENV)
-    if token is None or not token.strip():
-        print(f"{TOKEN_ENV} must be set", file=sys.stderr)
-        return 2
+CONNECTED_PEER_GRANTS: Mapping[str, Mapping[str, str]] = {
+    "atlas-ecom": {
+        MANUAL_SALES_CAPABILITY: "proposer",
+        AUDIT_CAPABILITY: "reader",
+    },
+}
+"""The grants this transport ships, and a record of debt rather than design.
 
+``atlas-ecom`` is the one peer whose configuration is known here, and these two
+rows are all of it:
+
+* ``audit.snapshot:reader`` is what Ecom has always used and is what the read
+  profile is for.
+* ``sales.manual_sales:proposer`` is the role **both** product contracts already
+  name for Ecom -- it submits intent, and ERP decides recognition, quantity, and
+  value -- and it is the role SPEC.md gives a peer that may ask the master to
+  change a capability without changing it.  It is a working authority now:
+  ``POST /connect/sales`` asks the ``propose`` permission, so a peer holds
+  exactly enough to ask, and the master decides and applies.
+
+The grant that would let a peer write is ``master``, and it is not available:
+one master per capability (SPEC.md, G2) is the module's own rule, the serving app
+already holds every capability it serves, and ``ProtocolKernel.grant`` refuses a
+second master.  So the write stays closed to peers by the module's semantics
+rather than by this file, and the connected sale reaches the domain as a
+proposal the master accepted rather than as a peer's request applied on trust.
+
+``tests/test_connect_authority.py`` pins these two rows exactly, so the day they
+change is a deliberate commit rather than a quiet widening of what a peer may do.
+"""
+
+
+def grant_configured_peers(protocol: ProtocolKernel) -> None:
+    """Apply :data:`CONNECTED_PEER_GRANTS` to a kernel, one peer at a time."""
+
+    for peer_id, capabilities in CONNECTED_PEER_GRANTS.items():
+        for capability, role in capabilities.items():
+            protocol.grant(capability, peer_id, role)
+
+
+def _environment_peer_tokens() -> dict[str, str]:
+    """Return the peer credentials named by the environment, or refuse.
+
+    ``ATLAS_ERP_PEER_TOKENS`` is a JSON object mapping a peer ``app_id`` to that
+    peer's token, for example ``{"atlas-ecom": "<token>"}``.  JSON because every
+    other value this transport reads is JSON, and because one unambiguous format
+    is what lets one variable carry one peer or ten without a second form to get
+    wrong.  An unset or unreadable value is a startup failure rather than an empty
+    map: an empty map would serve nobody while announcing itself as a started
+    transport, and a value that cannot be parsed is a typo, not an absence.
+    """
+
+    raw = os.environ.get(PEER_TOKENS_ENV, "")
+    if not raw.strip():
+        raise ValueError(
+            f"{PEER_TOKENS_ENV} must be set to a JSON object of peer app_id to token"
+        )
     try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{PEER_TOKENS_ENV} must be a JSON object of peer app_id to token"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{PEER_TOKENS_ENV} must be a JSON object of peer app_id to token"
+        )
+    return cast("dict[str, str]", value)
+
+
+def main() -> int:
+    try:
+        peer_tokens = _environment_peer_tokens()
         host = os.environ.get(HOST_ENV, DEFAULT_HOST)
         port = _environment_port()
         store = _database_store()
         business_store = _business_store()
         business, protocol = _startup_business(business_store)
+        grant_configured_peers(protocol)
         server = ConnectServer(
             business,
             protocol,
-            token,
+            peer_tokens,
             host=host,
             port=port,
             sale_store=store,
             business_store=business_store,
         )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, ProtocolError) as exc:
         print(f"could not start Atlas ERP Connect: {exc}", file=sys.stderr)
         return 2
 
@@ -972,6 +1221,8 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "AUDIT_CAPABILITY",
+    "CONNECTED_PEER_GRANTS",
     "ConnectHandler",
     "ConnectServer",
     "DATABASE_ENV",
@@ -982,8 +1233,10 @@ __all__ = [
     "JSON_CONTENT_TYPE",
     "MANUAL_SALES_CAPABILITY",
     "MAX_BODY_BYTES",
+    "PEER_TOKENS_ENV",
     "PORT_ENV",
-    "TOKEN_ENV",
+    "ROUTE_AUTHORITY",
+    "grant_configured_peers",
     "main",
     "sale_command_hash",
     "snapshot_cursor",

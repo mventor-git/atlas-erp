@@ -31,7 +31,10 @@ class AtlasErpConformanceTests(unittest.TestCase):
             "inventory",
             "stock",
             "availability",
-            {"inventory.stock": {"read", "write"}},
+            # The advertised set of a real capability row, which is where the
+            # product derives ``propose`` from ``write``; a proposal is refused
+            # for a capability that does not advertise it.
+            {"inventory.stock": {"read", "write", "propose"}},
         )
         return registry
 

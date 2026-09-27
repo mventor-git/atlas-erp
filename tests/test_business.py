@@ -177,13 +177,16 @@ class BusinessPathTests(unittest.TestCase):
         # capability that is served read-only must not also advertise a write.
         # ``audit.snapshot`` is the transport's read projection and has no write
         # route, so advertising one would be a grant that can never be honoured.
+        # ``propose`` goes where ``write`` does, for the same reason: it is a
+        # request for the master to change the capability, which a projection
+        # cannot be.
         manifest = Business(Registry()).registry.manifest()
         advertised = cast(dict[str, list[str]], manifest["permissions"])
 
         self.assertEqual(advertised["audit.snapshot"], ["read"])
         for capability in set(advertised) - {"audit.snapshot"}:
             with self.subTest(capability=capability):
-                self.assertEqual(advertised[capability], ["read", "write"])
+                self.assertEqual(advertised[capability], ["propose", "read", "write"])
 
     def test_manual_sale_decrements_stock_and_posts_balanced_journal(self) -> None:
         order = self.business.create_purchase_order(

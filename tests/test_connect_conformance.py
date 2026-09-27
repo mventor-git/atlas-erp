@@ -42,7 +42,13 @@ class ConnectConformanceTests(unittest.TestCase):
         )
         self.business.receive_purchase_order(order.order_id, "receipt-conformance-1")
         self.protocol = ProtocolKernel(self.business.registry)
-        self.server = ConnectServer(self.business, self.protocol, TOKEN, port=0)
+        # As the app that serves them, for the reason given in
+        # tests/test_connect_server.py: only the master of a served capability
+        # may write it, and the read here is a check that the served capability
+        # is a capability the kernel can be told about at all.
+        self.server = ConnectServer(
+            self.business, self.protocol, {"atlas-erp": TOKEN}, port=0
+        )
         self.server.start()
         self.addCleanup(self.server.stop)
 
