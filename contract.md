@@ -3,7 +3,7 @@
 ## Metadata
 
 - Product: Atlas ERP
-- Contract version: 1.5.0
+- Contract version: 1.6.0
 - Status: ACTIVE
 - Date: 2026-09-26
 - Approval date: 2026-09-26
@@ -138,8 +138,18 @@ convenient.
   snapshots behind an opaque cursor, ordered deltas, idempotent inbox handling
   by event id, and proposal transitions.
 - Exactly two capabilities are implemented on the wire, and they are the whole
-  of it: `audit.snapshot`, read from its owner, and `sales.manual_sales`, a
-  single command submitted to its owner.
+  of it: `audit.snapshot`, read from its owner, and `sales.manual_sales`, which
+  crosses as a **proposal** its owner decides rather than as a command. No peer
+  can write: the owning product is the sole master of every capability it
+  serves, and a peer submits intent that the owner validates and applies. The
+  owner's decision point is a policy question and is currently open — the owner
+  decides immediately and deterministically, using its own domain invariants,
+  and an operator-in-the-loop decision would need a write path that does not
+  exist yet.
+- The proposal record is process-local. A request-keyed receipt replays across a
+  restart, but the proposal behind it does not survive one, so a replayed
+  receipt may name a sale whose proposal no longer exists. A durable proposal
+  record is owed before a proposal can be treated as evidence of a decision.
 - Peering is asymmetric. This product serves both implemented capabilities and
   its peer serves none; the serving side is the authority for every record it
   owns. A manifest names an intent, and this section — not a manifest —
@@ -399,3 +409,4 @@ another product's components to build.
 | 1.4.0 | 2026-09-26 | Approved the separation and interoperability rules, the record of what crosses the boundary today, and the separation gate. | ACTIVE |
 | 1.4.1 | 2026-09-26 | Corrected a false claim that a durable local outbox exists. Delivery is a direct synchronous call and a request-keyed receipt is what is durable; recorded the measured finding that the shipped connect path bypasses the protocol module. | ACTIVE |
 | 1.5.0 | 2026-09-26 | Added `audit` as a seventh baseline cluster for the read projection the connect transport serves, scoped read-only, and recorded that the projection-versus-composed-read modelling is a later decision. | ACTIVE |
+| 1.6.0 | 2026-09-26 | Corrected the record of what crosses: `sales.manual_sales` crosses as a proposal the owner decides, not as a command, because no peer may write a capability its owner is the sole master of. Recorded the open decision point and the process-local proposal ceiling. | ACTIVE |
