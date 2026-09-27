@@ -19,6 +19,19 @@ from .registry import DEFAULT_CONNECT_VERSION, Registry
 
 CONNECT_VERSION = DEFAULT_CONNECT_VERSION
 _AUTHORITY_ROLES = frozenset({"master", "reader", "proposer"})
+# What each role may do directly.  Proposing is a separate flow, not a write, so
+# a proposer reads the capability it may not change.
+_ROLE_PERMISSIONS: Mapping[str, frozenset[str]] = {
+    "master": frozenset({"read", "write"}),
+    "reader": frozenset({"read"}),
+    "proposer": frozenset({"read"}),
+}
+# The internal reader gate is a projection of the table above rather than a
+# second statement of it, so the public ``authorize`` seam and the gate cannot
+# answer the read question differently.
+_READERS: frozenset[str] = frozenset(
+    role for role, permissions in _ROLE_PERMISSIONS.items() if "read" in permissions
+)
 
 
 class ProtocolError(ValueError):
@@ -392,12 +405,16 @@ class ProtocolKernel:
             "moved_data": False,
         }
 
-    def grant(self, capability: str, peer_id: str, role: str = "reader") -> None:
-        capability = _text(capability, "capability")
-        peer_id = _text(peer_id, "peer_id")
-        role = _text(role, "authority role")
+    def _known_capability(self, capability: str) -> str:
+        """Return the capability, or refuse it the way every caller must."""
         if capability not in self._authorities:
             raise ProtocolError(f"unknown capability: {capability}")
+        return capability
+
+    def grant(self, capability: str, peer_id: str, role: str = "reader") -> None:
+        capability = self._known_capability(_text(capability, "capability"))
+        peer_id = _text(peer_id, "peer_id")
+        role = _text(role, "authority role")
         assignments = dict(self._authorities[capability])
         assignments[peer_id] = role
         validated = validate_authorities({capability: assignments})[capability]
@@ -414,11 +431,42 @@ class ProtocolKernel:
         role = assignments[peer_id]
         if role == required_role:
             return
-        if required_role == "reader" and role == "master":
+        if required_role == "reader" and role in _READERS:
             return
         raise PermissionDeniedError(
             f"{peer_id} has {role} authority, not {required_role}, for {capability}"
         )
+
+    def authorize(self, peer_id: str, capability: str, permission: str) -> None:
+        """Raise unless a peer may exercise a permission on a capability.
+
+        This is the question a transport asks before it acts: the module answers
+        it about *any* peer instead of only about itself.  The capability must be
+        known, the permission must be one that capability advertises, and the
+        peer's role must permit it.  An ``app_id`` with no grant is refused, so
+        being a peer implies no authority.
+        """
+        capability = self._known_capability(_text(capability, "capability"))
+        peer_id = _text(peer_id, "peer_id")
+        permission = _text(permission, "permission")
+        advertised = cast(
+            Mapping[str, Iterable[str]], self.manifest()["permissions"]
+        )
+        # Grants are stored per capability only.  SPEC.md scopes them "for the
+        # capability and connection" and no connection object exists yet; that
+        # model is a later decision, so a peer id is the finest scope available.
+        if permission not in advertised.get(capability, ()):
+            raise PermissionDeniedError(
+                f"{capability} does not advertise the {permission} permission"
+            )
+        assignments = self._authorities[capability]
+        if peer_id not in assignments:
+            raise PermissionDeniedError(f"{peer_id} has no authority for {capability}")
+        role = assignments[peer_id]
+        if permission not in _ROLE_PERMISSIONS[role]:
+            raise PermissionDeniedError(
+                f"{peer_id} has {role} authority, not {permission}, for {capability}"
+            )
 
     def publish(self, capability: str, event_id: str, payload: object) -> Delta:
         capability = _text(capability, "capability")
