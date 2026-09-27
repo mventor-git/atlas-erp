@@ -77,6 +77,10 @@ The v1 baseline clusters are `masterdata`, `inventory`, `purchasing`, `sales`,
 connect transport serves: it spans the item master, stock, sales, journals and
 movements rather than owning any one of them, and it is served read-only, so a
 manifest advertises `audit.snapshot:read` and never a write it cannot honour.
+Read-only here means the projection has no write because it is computed from the
+capabilities it spans, not that the transport declines to expose one: there is no
+stored projection to write into, so a write would create no record and a
+manifest promising one could never be honoured.
 Whether a cross-cutting projection should be modelled as one capability or as a
 read composed over the capabilities it spans is a later decision; the name and
 its read-only scope are fixed here. Atlas ERP has its own console and embeds the

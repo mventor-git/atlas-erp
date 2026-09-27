@@ -16,6 +16,7 @@ from atlas_erp import (
     handshake,
     validate_authorities,
 )
+from atlas_erp.protocol import _ROLE_PERMISSIONS
 
 PEER_APP_ID = "atlas-ecom"
 SALES = "sales.manual_sales"
@@ -30,7 +31,7 @@ class AtlasErpConformanceTests(unittest.TestCase):
             "inventory",
             "stock",
             "availability",
-            {"inventory.stock": {"read"}},
+            {"inventory.stock": {"read", "write"}},
         )
         return registry
 
@@ -68,6 +69,26 @@ class AtlasErpConformanceTests(unittest.TestCase):
                     }
                 }
             )
+
+    def test_the_permissions_table_is_the_only_statement_of_the_roles(self) -> None:
+        # Roles are named once, by the permissions table, and validate_authorities
+        # reads that same table rather than a second list of its own.  So a role
+        # added there is grantable with nothing else to update, and the two can
+        # no longer disagree about which role names exist.
+        for role in sorted(_ROLE_PERMISSIONS):
+            with self.subTest(role=role):
+                assignments = (
+                    {"p": role} if role == "master" else {"m": "master", "p": role}
+                )
+                self.assertEqual(
+                    validate_authorities({"inventory.stock": assignments})[
+                        "inventory.stock"
+                    ],
+                    assignments,
+                )
+        with self.assertRaises(AuthorityConflictError) as unknown:
+            validate_authorities({"inventory.stock": {"m": "master", "p": "root"}})
+        self.assertIn("unknown authority role", str(unknown.exception))
 
     def test_pairing_defaults_to_share_only_without_moving_data(self) -> None:
         adapter = InMemoryProtocolAdapter()
@@ -287,12 +308,12 @@ class AuthorisationAgreesWithTheGateTests(unittest.TestCase):
     def test_the_write_seam_and_the_write_gate_agree_for_the_master(self) -> None:
         # publish() is the master-gated write and takes no peer_id: it always runs
         # as the app that owns the capability, so the master is the only peer the
-        # two answers can be compared for.  Capabilities that advertise no write
-        # are excluded because the gate does not consult the manifest; that
-        # remaining gap is named by the case below rather than hidden here.
-        for capability, permissions in sorted(self.advertised.items()):
-            if "write" not in permissions:
-                continue
+        # two answers can be compared for.  Every capability is swept, read-only
+        # ones included, because the gate now consults the same advertised
+        # permissions the seam does instead of a second statement of its own.
+        # audit.snapshot is the case that earned the sweep: a computed projection
+        # with no stored record for a write to create.
+        for capability in sorted(self.advertised):
             with self.subTest(capability=capability):
                 kernel = self.kernel_holding(capability, "master")
                 self.assertEqual(
@@ -317,24 +338,6 @@ class AuthorisationAgreesWithTheGateTests(unittest.TestCase):
             proposal.proposal_id, "accepted", "reviewed by owner"
         )
         self.assertEqual(accepted.state, "accepted")
-
-    def test_publish_ignores_the_advertised_permissions_the_seam_enforces(self) -> None:
-        """A second, still-open divergence of the same class, kept visible.
-
-        ``authorize`` refuses a write the capability does not advertise, and no
-        ``_require_role`` gate consults the manifest, so a master can still
-        publish into a read-only capability.  This task does not decide that: the
-        contract has to say whether a read-only capability is immutable or merely
-        unreadable over Connect.  Asserted so the gap cannot be forgotten; delete
-        this case when ``publish`` consults the manifest.
-        """
-        kernel = ProtocolKernel(self.registry)
-        with self.assertRaises(PermissionDeniedError):
-            kernel.authorize(kernel.app_id, AUDIT, "write")
-        self.assertTrue(
-            self._allowed(lambda: kernel.publish(AUDIT, "e1", {"n": 1})),
-            "the read-only capability is no longer writable; update the case above",
-        )
 
 
 if __name__ == "__main__":

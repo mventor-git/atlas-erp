@@ -18,9 +18,11 @@ from .registry import DEFAULT_CONNECT_VERSION, Registry
 
 
 CONNECT_VERSION = DEFAULT_CONNECT_VERSION
-_AUTHORITY_ROLES = frozenset({"master", "reader", "proposer"})
-# What each role may do directly.  Proposing is a separate flow, not a write, so
-# a proposer reads the capability it may not change.
+# The role vocabulary and what each role may do directly.  This table is the
+# only statement of both, so every other question about a role -- which names
+# exist, which may read, who may write -- is read from it.  Proposing is a
+# separate flow, not a write, so a proposer reads the capability it may not
+# change.
 _ROLE_PERMISSIONS: Mapping[str, frozenset[str]] = {
     "master": frozenset({"read", "write"}),
     "reader": frozenset({"read"}),
@@ -113,7 +115,7 @@ def validate_authorities(
         peers: dict[str, str] = {}
         for peer_id, role in assignments.items():
             peer_id = _text(peer_id, "peer_id")
-            if role not in _AUTHORITY_ROLES:
+            if role not in _ROLE_PERMISSIONS:
                 raise AuthorityConflictError(
                     f"unknown authority role for {capability}: {role!r}"
                 )
@@ -470,7 +472,13 @@ class ProtocolKernel:
 
     def publish(self, capability: str, event_id: str, payload: object) -> Delta:
         capability = _text(capability, "capability")
-        self._require_role(capability, self.app_id, "master")
+        # One statement of the write rule, taken from the same table the seam
+        # reads: this runs the public ``authorize`` check as the app that owns
+        # the capability, so a capability advertising no write cannot be
+        # published into even by its master.  audit.snapshot is refused because
+        # it is a projection computed from the capabilities it spans, so there
+        # is no stored record for a write to create.
+        self.authorize(self.app_id, capability, "write")
         return self.adapter.append_delta(capability, event_id, payload)
 
     def snapshot(self, capability: str, peer_id: str | None = None) -> Snapshot:
