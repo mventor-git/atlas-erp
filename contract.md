@@ -3,7 +3,7 @@
 ## Metadata
 
 - Product: Atlas ERP
-- Contract version: 1.6.0
+- Contract version: 1.7.0
 - Status: ACTIVE
 - Date: 2026-09-26
 - Approval date: 2026-09-26
@@ -116,7 +116,17 @@ convenient.
 ### What crosses the boundary
 
 - The protocol is the only channel. No shared filesystem, no direct database
-  access, and no side channel carries product data between them.
+  access, and no side channel carries product data between them. The protocol
+  module's own durable store is not a side channel and is not a peer's database:
+  it belongs to the protocol, product domain code never reads or writes it, and
+  only the protocol adapter reaches it. A peer reaches it with credentials
+  scoped to its own records and sees nothing of any other peer's, which is the
+  same relationship it has with any protocol endpoint that keeps state.
+- No crossing is atomic across the three databases. A record the protocol
+  stores and an effect an owner applies live in different databases and cannot
+  be committed together, and no two-phase commit is attempted. What the shared
+  store buys is that the *decision* survives a restart, not that the decision
+  and its effect are one transaction.
 - Direction carries meaning. A command travels toward the owner of the record
   it changes; a read projection travels back to the requester. A product never
   asks its peer to decide something the requester owns.
@@ -410,3 +420,4 @@ another product's components to build.
 | 1.4.1 | 2026-09-26 | Corrected a false claim that a durable local outbox exists. Delivery is a direct synchronous call and a request-keyed receipt is what is durable; recorded the measured finding that the shipped connect path bypasses the protocol module. | ACTIVE |
 | 1.5.0 | 2026-09-26 | Added `audit` as a seventh baseline cluster for the read projection the connect transport serves, scoped read-only, and recorded that the projection-versus-composed-read modelling is a later decision. | ACTIVE |
 | 1.6.0 | 2026-09-26 | Corrected the record of what crosses: `sales.manual_sales` crosses as a proposal the owner decides, not as a command, because no peer may write a capability its owner is the sole master of. Recorded the open decision point and the process-local proposal ceiling. | ACTIVE |
+| 1.7.0 | 2026-09-26 | Authorised a protocol-owned durable store, `atlas_connect`, belonging to neither product, reachable only by the protocol adapter and scoped per peer, as the durable home of a crossing decision. Recorded that no crossing is atomic across the three databases. | ACTIVE |
