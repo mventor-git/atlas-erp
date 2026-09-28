@@ -106,7 +106,11 @@ IMAGE_TIMEOUT_SECONDS = 300
 DOCKER_TIMEOUT_SECONDS = 60
 READY_TIMEOUT_SECONDS = 90
 # The store tests this script runs against the instances it just provisioned.
-STORE_TEST_TIMEOUT_SECONDS = 180
+# Raised from 180s when the reconciler's restart proof joined that file: it starts
+# real child processes against these same instances, so the file now does work
+# that is measured in process startups rather than in queries.  The budget only
+# matters when a case hangs.
+STORE_TEST_TIMEOUT_SECONDS = 300
 # The three databases, as the isolation checks name them.
 ISOLATED_DATABASES = (ERP_DATABASE, ECOM_DATABASE, CONNECT_DATABASE)
 # The peer whose real login is aimed at another peer's row, and a second peer so

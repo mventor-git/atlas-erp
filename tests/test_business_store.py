@@ -16,8 +16,6 @@ import os
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
-from types import SimpleNamespace
-from typing import cast
 from uuid import uuid4
 
 from atlas_erp import (
@@ -27,7 +25,7 @@ from atlas_erp import (
     PostgresBusinessStore,
     snapshot_cursor,
 )
-from atlas_erp.connect_server import ConnectHandler, _seed_business_store
+from atlas_erp.connect_server import _seed_business_store, _write_business_state
 
 DATABASE_ENV = "ATLAS_ERP_DATABASE_URL"
 # The tables the store owns.  A test reads them; it never creates them.
@@ -84,24 +82,6 @@ def _post_a_connected_sale(business: Business, prefix: str) -> str:
         sale_id=sale_id,
     )
     return sale_id
-
-
-def _write_business_state(business: Business, store: BusinessStore, sale_id: str) -> None:
-    """Drive the connect handler's durable write for one posted sale.
-
-    The socket and the receipt are not what is under test and the serving path
-    is pinned by ``test_connect_server``; this write reads exactly two
-    attributes off its server, so the handler is stood in for rather than
-    served.
-    """
-
-    handler = cast(
-        "ConnectHandler",
-        SimpleNamespace(
-            server=SimpleNamespace(business=business, business_store=store)
-        ),
-    )
-    ConnectHandler._write_business_state(handler, sale_id)
 
 
 class BusinessStoreRoundTrip:

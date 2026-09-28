@@ -13,7 +13,10 @@ decision survives a restart**, not that a decision and its effect are one
 transaction.  A proposal row lives here while the sale it authorised lives in the
 owner's database, and no two-phase commit is attempted, so a crash between the
 two leaves a decided proposal with no effect -- visible, reconcilable, and
-resolvable, which is the whole point of keeping the decision at all.
+resolvable, which is the whole point of keeping the decision at all.  What
+completes it is :func:`~atlas_erp.connect_server.reconcile_accepted_proposals`,
+once at startup, because that is the one moment an ``accepted`` row with no
+effect has only one possible explanation.
 
 Two adapters implement the one :class:`ProposalStore` interface:
 
@@ -85,6 +88,15 @@ DECIDED_STATES = (ACCEPTED, REJECTED)
 # gains the constraint.  That is a missing migration runner, the same recorded
 # undone item the other two stores carry, and it is not worth a migration system
 # to avoid on a table with one writer.
+#
+# ponytail: this table grows one row per connected sale and nothing removes one.
+# Every decision is terminal and a decided row is only read again by
+# :func:`~atlas_erp.connect_server.reconcile_accepted_proposals` on a boot where
+# its effect is missing, so the growth is pure audit history past that point and
+# the ceiling is unbounded retention on a table with one writer.  The upgrade path
+# is a retention policy -- an age or a count past which a decided row is archived
+# or deleted -- and it is deliberately not written here because how long a peer's
+# decision must stay answerable is a policy question, not an engineering one.
 CREATE_PROPOSALS_SQL = (
     """
 CREATE TABLE IF NOT EXISTS connect_proposals (

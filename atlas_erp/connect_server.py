@@ -31,6 +31,13 @@ it is read only by the protocol adapter.  See
 :mod:`atlas_erp.proposal_store`; no product domain code in this package reaches
 it.  Unset, the decision stays process-local and everything else behaves exactly
 as it did.
+
+A decision in that store outlives the process while the sale it authorised lives
+in this product's own database, and the two writes are in two databases and are
+not one transaction.  So a crash between them leaves an accepted decision whose
+effect never happened, and the store is reconciled once at startup -- before this
+transport binds a socket -- by :func:`reconcile_accepted_proposals`.  That is
+startup-only on purpose, and the function says why.
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ import socket
 import sys
 import threading
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from ipaddress import ip_address
 from typing import Any, cast
@@ -61,7 +69,7 @@ from .protocol import (
     ProtocolError,
     ProtocolKernel,
 )
-from .proposal_store import PostgresProposalStore, ProposalStore
+from .proposal_store import ACCEPTED, PostgresProposalStore, ProposalStore
 from .sale_store import (
     IN_PROGRESS,
     PAYLOAD_CONFLICT,
@@ -80,6 +88,11 @@ CONNECT_DATABASE_ENV = "ATLAS_ERP_CONNECT_DATABASE_URL"
 JSON_CONTENT_TYPE = "application/json"
 MANUAL_SALES_CAPABILITY = "sales.manual_sales"
 AUDIT_CAPABILITY = "audit.snapshot"
+# The one refusal a reconciliation reads as success.  A repeated ``sale_id`` is
+# the state it is trying to produce, so it is not a failure to report; every
+# other code is.  It is a constant rather than a literal at the comparison
+# because the same wire string is produced in one place and read in another.
+DUPLICATE_SALE = "duplicate sale"
 MAX_BODY_BYTES = 64 * 1024
 # A rejected body is drained up to this size before the connection is closed.
 DRAIN_LIMIT_BYTES = 1024 * 1024
@@ -467,7 +480,9 @@ class ConnectHandler(BaseHTTPRequestHandler):
             # The durable write comes before the receipt on purpose: a store
             # that cannot record the sale aborts the key below, so the peer is
             # never handed a 201 for a sale no restart would still know about.
-            self._write_business_state(sale_id)
+            _write_business_state(
+                self.server.business, self.server.business_store, sale_id
+            )
         except BaseException:
             # A rejected command must not burn the idempotency key.
             store.abort(sale_id)
@@ -502,13 +517,18 @@ class ConnectHandler(BaseHTTPRequestHandler):
 
         # ponytail: the proposal lives in the protocol adapter, and the adapter is
         # where a durable store is injected -- so the decision now survives a
-        # restart and a replayed receipt names a proposal that still exists.  The
-        # ceiling that remains is the one the contract names: this row and the
-        # sale it authorised are in two databases, so a crash between the
-        # ``accepted`` write below and the domain write leaves a decision with no
-        # effect.  Reconciling that is idempotency and reconciliation, not a
-        # two-phase commit, and merging the stores into one transaction is not
-        # available to ask for.
+        # restart and a replayed receipt names a proposal that still exists.
+        #
+        # The order here is the load-bearing part, and it is *not* one
+        # transaction: the domain write runs first and the ``accepted`` row is
+        # written after it, so a crash in between leaves a ``pending`` proposal
+        # and a sale that exists.  The window this slice closes is the other one,
+        # after that: the ``accepted`` row is durable while the sale is still only
+        # in this process, and the durable write below can fail or be lost.
+        # :func:`reconcile_accepted_proposals` finishes that half at startup.  The
+        # ``pending`` half it deliberately leaves alone, because the master never
+        # decided and reconciling it would be inventing a decision.  Neither
+        # direction is a two-phase commit, and the contract says so.
         """
 
         customer_id, sale_id, lines = request
@@ -522,7 +542,9 @@ class ConnectHandler(BaseHTTPRequestHandler):
             peer_id=peer_id,
         )
         try:
-            payload = self._create_manual_sale(request)
+            payload = _post_manual_sale(
+                self.server.business, self.server.protocol.app_id, request
+            )
         except _RequestError as error:
             # The domain's own refusal is the decision, and its code is the
             # reason: a peer is told the same thing either way.
@@ -534,81 +556,6 @@ class ConnectHandler(BaseHTTPRequestHandler):
             proposal.proposal_id, "accepted", f"posted {payload['sale_id']}"
         )
         return payload
-
-    def _write_business_state(self, sale_id: str) -> None:
-        """Write one posted sale, its journal, and its movements through.
-
-        A no-op without a business store, where the in-memory domain is the
-        only state there is.  The movements are read back off the domain rather
-        than rebuilt, so the durable movement ids are the ones the domain
-        itself minted.
-
-        The sale, its journal, and its movements are one transaction because
-        stock is a sum over the movement rows rather than a stored level: a
-        durable sale whose movements never landed is not a loud half-write but a
-        number that is now permanently too high, and no later restart corrects
-        it.  A crash between two bare calls would be exactly that.
-        """
-
-        store = self.server.business_store
-        if store is None:
-            return
-        business = self.server.business
-        sale = business.get_sale(sale_id)
-        with store.transaction():
-            store.save_sale(sale, business.get_journal_for_sale(sale_id))
-            store.save_movements(business.sale_movements(sale_id))
-
-    def _create_manual_sale(
-        self, request: tuple[str, str, list[dict[str, object]]]
-    ) -> dict[str, object]:
-        """Post one guarded manual sale and return its wire result."""
-
-        business = self.server.business
-        customer_id, sale_id, lines = request
-        try:
-            for line in lines:
-                item = business.get_item(cast(str, line["item_id"]))
-                if line["unit_price_cents"] != item.price_cents:
-                    raise _RequestError(400, "price mismatch")
-            sale = business.create_manual_sale(customer_id, lines, sale_id=sale_id)
-        except _RequestError:
-            raise
-        except DuplicateSaleError as exc:
-            raise _RequestError(409, "duplicate sale") from exc
-        except InsufficientStockError as exc:
-            raise _RequestError(409, "insufficient stock") from exc
-        except BusinessError as exc:
-            raise _RequestError(400, "invalid request") from exc
-        journal = business.get_journal_for_sale(sale.sale_id)
-        return {
-            "app_id": self.server.protocol.app_id,
-            "capability": MANUAL_SALES_CAPABILITY,
-            "sale_id": sale.sale_id,
-            "customer_id": sale.customer_id,
-            "journal_id": sale.journal_id,
-            "total_cents": sale.total_cents,
-            # The posted sale record, in the same typed shape as the audit
-            # snapshot, so a peer can validate the result it was handed.
-            "lines": [
-                {
-                    "item_id": line.item_id,
-                    "quantity": line.quantity,
-                    "unit_price_cents": line.unit_price_cents,
-                    "total_cents": line.total_cents,
-                }
-                for line in sale.lines
-            ],
-            "stock": [
-                {"item_id": item_id, "quantity": business.stock_for(item_id)}
-                for item_id in dict.fromkeys(
-                    cast(str, line["item_id"]) for line in lines
-                )
-            ],
-            "journal_balanced": (
-                journal.total_debits_cents == journal.total_credits_cents
-            ),
-        }
 
     def _drain_body(self) -> None:
         """Read and discard a rejected body that is small enough to drain.
@@ -810,6 +757,198 @@ class ConnectHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if getattr(self, "command", None) != "HEAD":
             self.wfile.write(body)
+
+
+def _post_manual_sale(
+    business: Business,
+    app_id: str,
+    request: tuple[str, str, list[dict[str, object]]],
+) -> dict[str, object]:
+    """Post one guarded manual sale into the domain and return its wire result.
+
+    A module-level function rather than a handler method for one reason: the
+    startup reconciliation has to put a recovered decision into the domain by the
+    *same* route the request that lost it took, price check and refusals
+    included.  A second copy of these rules would be a second answer to the same
+    question, and the one that mattered would be the one nothing tests.
+    """
+
+    customer_id, sale_id, lines = request
+    try:
+        for line in lines:
+            item = business.get_item(cast(str, line["item_id"]))
+            if line["unit_price_cents"] != item.price_cents:
+                raise _RequestError(400, "price mismatch")
+        sale = business.create_manual_sale(customer_id, lines, sale_id=sale_id)
+    except _RequestError:
+        raise
+    except DuplicateSaleError as exc:
+        raise _RequestError(409, DUPLICATE_SALE) from exc
+    except InsufficientStockError as exc:
+        raise _RequestError(409, "insufficient stock") from exc
+    except BusinessError as exc:
+        raise _RequestError(400, "invalid request") from exc
+    journal = business.get_journal_for_sale(sale.sale_id)
+    return {
+        "app_id": app_id,
+        "capability": MANUAL_SALES_CAPABILITY,
+        "sale_id": sale.sale_id,
+        "customer_id": sale.customer_id,
+        "journal_id": sale.journal_id,
+        "total_cents": sale.total_cents,
+        # The posted sale record, in the same typed shape as the audit
+        # snapshot, so a peer can validate the result it was handed.
+        "lines": [
+            {
+                "item_id": line.item_id,
+                "quantity": line.quantity,
+                "unit_price_cents": line.unit_price_cents,
+                "total_cents": line.total_cents,
+            }
+            for line in sale.lines
+        ],
+        "stock": [
+            {"item_id": item_id, "quantity": business.stock_for(item_id)}
+            for item_id in dict.fromkeys(
+                cast(str, line["item_id"]) for line in lines
+            )
+        ],
+        "journal_balanced": (
+            journal.total_debits_cents == journal.total_credits_cents
+        ),
+    }
+
+
+def _write_business_state(
+    business: Business, store: BusinessStore | None, sale_id: str
+) -> None:
+    """Write one posted sale, its journal, and its movements through.
+
+    A no-op without a business store, where the in-memory domain is the
+    only state there is.  The movements are read back off the domain rather
+    than rebuilt, so the durable movement ids are the ones the domain
+    itself minted.
+
+    The sale, its journal, and its movements are one transaction because
+    stock is a sum over the movement rows rather than a stored level: a
+    durable sale whose movements never landed is not a loud half-write but a
+    number that is now permanently too high, and no later restart corrects
+    it.  A crash between two bare calls would be exactly that.  That one
+    transaction is the reason a repeated ``sale_id`` can only mean "the sale is
+    there", and is why the reconciliation below may read it as success.
+    """
+
+    if store is None:
+        return
+    sale = business.get_sale(sale_id)
+    with store.transaction():
+        store.save_sale(sale, business.get_journal_for_sale(sale_id))
+        store.save_movements(business.sale_movements(sale_id))
+
+
+@dataclass
+class Reconciliation:
+    """What one startup reconciliation did, and what it could not do.
+
+    ``applied`` and ``already_applied`` are the proposals whose effect the owner's
+    domain now holds, the first because this boot produced it and the second
+    because it was already there.  ``unapplied`` is the accepted decision that has
+    no effect and could not get one here, each with the reason, because that is
+    the case a person has to look at rather than wait for.
+    """
+
+    applied: list[str] = field(default_factory=list)
+    already_applied: list[str] = field(default_factory=list)
+    unapplied: list[tuple[str, str]] = field(default_factory=list)
+
+
+def reconcile_accepted_proposals(
+    business: Business,
+    protocol: ProtocolKernel,
+    business_store: BusinessStore | None,
+) -> Reconciliation:
+    """Apply the effects of accepted proposals the owner's database does not hold.
+
+    The decision and the sale it authorised are committed in two databases and are
+    not one transaction, so a crash can split them.  This walks the protocol's own
+    store, and for every ``accepted`` proposal whose named sale the restored domain
+    does not hold, it applies the effect through the same door the request took,
+    writes it through, and reports it.  A proposal whose effect is already there is
+    left exactly as it is.
+
+    The other two states are not this function's business.  A ``pending`` proposal
+    has not been decided -- or was never going to be -- and applying it would be
+    inventing a decision the master never made.  A ``rejected`` one must never be
+    applied at all, however well-formed its payload still looks.
+
+    **Startup only, and not on a timer.**  While this process is serving, an
+    ``accepted`` proposal with no effect yet is *legitimate*: the request that
+    carries it is in flight and its domain write is the next thing it will do.  A
+    reconciler firing then would read that as a crash casualty and apply the
+    effect under a writer about to apply it itself.  At startup no request is in
+    flight, so the same observation has one explanation and only one.  That is the
+    whole reason this is a startup step; the obvious "let's also run it every
+    minute" is that race, and it is wrong.
+
+    The receipts are deliberately not reconciled either.  A crash between the
+    durable write and ``store.complete`` leaves a ``pending`` receipt whose stored
+    response cannot be rebuilt: ``total_cents``, the per-item ``stock`` balances,
+    and the journal verdict all describe the domain as it was at apply time, so a
+    synthesised one would hand a peer a receipt describing a moment that never
+    existed.  A stale receipt stays the human decision it is today, and is the one
+    half of the window this does not close.
+    """
+
+    report = Reconciliation()
+    # The store's own order, which is the order the master decided them in, so
+    # two accepted sales for one item take its stock in the order they were
+    # accepted rather than in whatever order a dict happened to give.
+    for proposal in protocol.adapter.proposals.values():
+        if proposal.state != ACCEPTED:
+            continue
+        if proposal.capability != MANUAL_SALES_CAPABILITY:
+            # The store belongs to the protocol, so a row may name a capability
+            # this product does not serve.  There is no applier here for it, and
+            # running the manual-sale shape over a foreign capability would be
+            # inventing an effect rather than completing one.
+            report.unapplied.append(
+                (proposal.proposal_id, f"no applier for {proposal.capability}")
+            )
+            continue
+        try:
+            # The same validation a live request went through, so a recovered
+            # decision cannot take a route into the domain that a request for the
+            # same intent could not.
+            request = _sale_request(proposal.payload)
+        except _RequestError as error:
+            # The payload was validated when the master accepted it, so this is a
+            # record whose shape this version no longer accepts.  Report it; do
+            # not guess at what it meant.
+            report.unapplied.append((proposal.proposal_id, error.code))
+            continue
+        sale_id = request[1]
+        if sale_id in business.sales:
+            report.already_applied.append(proposal.proposal_id)
+            continue
+        try:
+            _post_manual_sale(business, protocol.app_id, request)
+        except _RequestError as error:
+            if error.code == DUPLICATE_SALE:
+                # A repeated ``sale_id`` is the state this is here to produce, so
+                # it is the work being done rather than a failure, and a
+                # reconciliation that completed on an earlier boot is not turned
+                # into a startup error by this one.
+                report.already_applied.append(proposal.proposal_id)
+            else:
+                # A durable decision whose effect is now impossible: the stock was
+                # sold on, the item is gone, the price moved.  Refusing to start
+                # would turn one unappliable decision into an outage that waiting
+                # cannot clear, so it is reported and the transport still serves.
+                report.unapplied.append((proposal.proposal_id, error.code))
+            continue
+        _write_business_state(business, business_store, sale_id)
+        report.applied.append(proposal.proposal_id)
+    return report
 
 
 def _retry_after(seconds: int | None) -> dict[str, str] | None:
@@ -1232,6 +1371,32 @@ def main() -> int:
         proposal_store = _proposal_store()
         business, protocol = _startup_business(business_store, proposal_store)
         grant_configured_peers(protocol)
+        # Above the ``ConnectServer`` call, which is where this transport binds
+        # and listens: an accepted decision with no effect is only unambiguous
+        # while nothing is in flight, and a peer must not be able to reach the
+        # domain before the decisions that were already made have been carried
+        # out.  Skipped entirely with no protocol database, where the store is
+        # process-local, empty at boot, and lost at exit.
+        report = (
+            reconcile_accepted_proposals(business, protocol, business_store)
+            if proposal_store is not None
+            else None
+        )
+        if report is not None and (report.applied or report.unapplied):
+            # One line, and only when there is something to say: a boot that
+            # reconciled nothing is the ordinary case and does not need a line of
+            # its own.
+            print(
+                "reconciled crossing decisions: "
+                + ", ".join(
+                    [f"applied {proposal_id}" for proposal_id in report.applied]
+                    + [
+                        f"could not apply {proposal_id} ({why})"
+                        for proposal_id, why in report.unapplied
+                    ]
+                ),
+                flush=True,
+            )
         server = ConnectServer(
             business,
             protocol,
@@ -1247,13 +1412,16 @@ def main() -> int:
 
     mode = "postgres" if store is not None else "in-memory"
     state = "postgres" if business_store is not None else "in-memory"
-    # The banner names the two stores whose mode an operator of *this product*
-    # configures.  The proposal store is a third thing on a third database and is
-    # left out on purpose: it is the protocol's, and no product setting chooses
-    # where a decision is kept.
+    decisions = "postgres" if proposal_store is not None else "in-memory"
+    # All three stores are named, and the third one no product setting chooses.
+    # An operator reading this needs to know whether a crossing decision survives
+    # a restart, because "the process went away and the decision with it" is the
+    # failure the protocol store exists to remove -- and it is invisible from the
+    # other two, both of which are about this product's own records.
     print(
         f"Atlas ERP Connect listening on {server.url} "
-        f"(sale receipts: {mode}, business state: {state})",
+        f"(sale receipts: {mode}, business state: {state},"
+        f" crossing decisions: {decisions})",
         flush=True,
     )
     try:
