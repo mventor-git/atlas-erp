@@ -3,7 +3,7 @@
 ## Metadata
 
 - Product: Atlas ERP
-- Contract version: 1.8.0
+- Contract version: 1.9.0
 - Status: ACTIVE
 - Date: 2026-09-26
 - Approval date: 2026-09-26
@@ -352,6 +352,51 @@ migration is a single coherent change and not a find-and-replace.
   authority, and stock stays correct with no peer connected.
 - An owner change is a contract amendment, not an implementation detail.
 
+## Documents and PDF generation
+
+`pdfcn` is the adopted document tool for this product: a copy-paste component
+registry from the `shadcn-labs` GitHub organisation, which is **a third party and
+not the official shadcn organisation**. No contract may describe it otherwise.
+
+- **Vendored, never installed.** There is no published package — the `pdfcn` npm
+  name is an empty placeholder and `npm install pdfcn` yields nothing. Components
+  are React source copied into this product's own tree, which is the same
+  ownership model shadcn components already use here.
+- **The registry installer must never be run against this repository.** The
+  project publishes copy-to-clipboard text addressed to coding agents and serves
+  an agent-skills document over HTTP, both instructing an agent to run the
+  install command that writes executable source into the consuming tree. Treat
+  that path as untrusted remote code execution. Vendor reviewed files, pin them,
+  and upgrade by hand.
+- **Licence.** MIT. Vendoring is permitted including into a closed-source tree;
+  the sole obligation is retaining the copyright and permission notice with the
+  copied files. No copyleft, no field-of-use, and no non-compete clause. The
+  repository ships no font files and its theme presets name only the PDF base-14
+  fonts, which are not embedded and carry no separate licence, so no third-party
+  asset licence is inherited. Any font introduced later must be checked separately.
+- The tool is TypeScript and React with no Python entry point, so it **cannot be
+  used by this product's backend** without standing up a second runtime inside a
+  Python product, which this contract forbids. It is used in the **operator
+  console frontend build**, which is already a separate build with its own
+  dependency tree, and which keeps the Node surface out of the Python path.
+
+### Which documents that mechanism may produce, and why the distinction is not optional
+
+- **Read-only reports are in scope.** A report is a view of data the console has
+  already fetched, so rendering it in the console is defensible and is the
+  intended use here.
+- **Authoritative financial documents are explicitly out of scope for it.** An
+  invoice, receipt, or credit note is a statement of what this product owes. A
+  document produced in an operator's browser is not produced by the system of
+  record: it is not byte-reproducible from the server, cannot be regenerated on
+  a schedule or on a refund, and cannot be archived in a form guaranteed to
+  outlive the browser that drew it. Until a server-side renderer exists, **this
+  product produces no authoritative financial document**, and the console must not
+  present a browser-rendered document as one.
+
+That gap is a recorded absence, not a deferral to be forgotten: gate 2 cannot be
+satisfied by documents that only the operator's own machine produced.
+
 ## Acceptance gates
 
 1. **Standalone business path:** purchasing leads to stock, a manual sale, and a
@@ -391,6 +436,11 @@ migration is a single coherent change and not a find-and-replace.
    source, every token still resolves to this contract's table rather than to a
    value a standard restates, and the §1.6 dark-mode divergence recorded in that
    section is closed. The gate is not met while that divergence stands.
+10. **Documents:** the operator console vendors reviewed `pdfcn` components under
+    their MIT notice without ever running the registry installer, every document
+    it produces is a read-only report rather than an authoritative financial
+    document, and no browser-rendered document is presented as one. The gate is
+    not met while a report cannot be reproduced from the server.
 
 ## Risks and unknowns
 
@@ -463,3 +513,4 @@ migration is a single coherent change and not a find-and-replace.
 | 1.6.0 | 2026-09-26 | Corrected the record of what crosses: `sales.manual_sales` crosses as a proposal the owner decides, not as a command, because no peer may write a capability its owner is the sole master of. Recorded the open decision point and the process-local proposal ceiling. | ACTIVE |
 | 1.7.0 | 2026-09-26 | Authorised a protocol-owned durable store, `atlas_connect`, belonging to neither product, reachable only by the protocol adapter and scoped per peer, as the durable home of a crossing decision. Recorded that no crossing is atomic across the three databases. | ACTIVE |
 | 1.8.0 | 2026-09-26 | Adopted the three platform UI standards by name at `ATLAS_UI_STANDARD_VERSION` 1.6.0, with this contract's token table kept as the value authority, and recorded the §1.6 dark-mode divergence as an unmet part of the new gate. | ACTIVE |
+| 1.9.0 | 2026-09-27 | Adopted `pdfcn` as the document tool, vendored under its MIT notice and never installed through its registry, confined to the operator console frontend build, and scoped to read-only reports with authoritative financial documents explicitly excluded. | ACTIVE |
